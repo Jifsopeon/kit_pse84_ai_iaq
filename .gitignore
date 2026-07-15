@@ -18,6 +18,18 @@ GeneratedSource/
 *.lock
 .mtbqueryapi
 
+# IAQ BLE GATT database and Bluetooth library descriptors used by proj_cm33_ns.
+!proj_cm33_ns/GeneratedSource/
+!proj_cm33_ns/GeneratedSource/cycfg_bt_settings.c
+!proj_cm33_ns/GeneratedSource/cycfg_bt_settings.h
+!proj_cm33_ns/GeneratedSource/cycfg_gap.c
+!proj_cm33_ns/GeneratedSource/cycfg_gap.h
+!proj_cm33_ns/GeneratedSource/cycfg_gatt_db.c
+!proj_cm33_ns/GeneratedSource/cycfg_gatt_db.h
+!proj_cm33_ns/libs/
+!proj_cm33_ns/libs/bt-fw-mur-cyw55513.mtb
+!proj_cm33_ns/libs/btstack.mtb
+
 # ModusToolbox BSP files. Any custom BSP file for code examples is shipped within the 'templates' folder
 # bsps/
 

@@ -38,7 +38,6 @@ APPNAME=proj_cm33_ns
 # If set to "true" or "1", display full command-lines when building.
 VERBOSE=
 
-
 ################################################################################
 # Advanced Configuration
 ################################################################################
@@ -53,7 +52,7 @@ VERBOSE=
 # ... then code in directories named COMPONENT_foo and COMPONENT_bar will be
 # added to the build
 #
-COMPONENTS+=FREERTOS RTOS_AWARE  
+COMPONENTS+=FREERTOS RTOS_AWARE WICED_BLE
 
 # Like COMPONENTS, but disable optional code that was enabled by default.
 DISABLE_COMPONENTS=
@@ -69,10 +68,10 @@ SOURCES+=
 
 # Like SOURCES, but for include directories. Value should be paths to
 # directories (without a leading -I).
-INCLUDES+=source/sen66
+INCLUDES+=GeneratedSource source source/sen66
 
 # Add additional defines to the build process (without a leading -D).
-DEFINES+=CY_RETARGET_IO_CONVERT_LF_TO_CRLF
+DEFINES+=CY_RETARGET_IO_CONVERT_LF_TO_CRLF CY_RTOS_AWARE CYBSP_BT_PLATFORM_CFG_BAUD_FEATURE=3000000
 
 # Select softfp or hardfp floating point. Default is softfp.
 VFP_SELECT+=
