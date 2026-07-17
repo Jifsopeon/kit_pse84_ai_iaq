@@ -30,9 +30,10 @@
 #define SEN66_TASK_PRIORITY                 (configMAX_PRIORITIES - 1U)
 #define SEN66_TASK_STACK_SIZE               (2048U)
 #define SEN66_STARTUP_DELAY_MS              (1200U)
-#define SEN66_SAMPLE_PERIOD_DEFAULT_MS      (1000U)
-#define SEN66_SAMPLE_PERIOD_MIN_MS          (1000U)
-#define SEN66_SAMPLE_PERIOD_MAX_MS          (60000U)
+#define SEN66_SAMPLE_INTERVAL_MS            (1000U)
+#define SEN66_SAMPLE_PERIOD_DEFAULT_MS      (SEN66_SAMPLE_INTERVAL_MS)
+#define SEN66_SAMPLE_PERIOD_MIN_MS          (SEN66_SAMPLE_INTERVAL_MS)
+#define SEN66_SAMPLE_PERIOD_MAX_MS          (SEN66_SAMPLE_INTERVAL_MS)
 #define SW1_POLL_PERIOD_MS                  (20U)
 #define SW1_DEBOUNCE_POLLS                  (3U)
 #define MANUAL_LABEL_NO_SMOKING             "no smoking"
@@ -40,6 +41,7 @@
 #define APP_DISTANCE_MAX_CM                 (500U)
 #define APP_SERIAL_LINE_SIZE                (384U)
 #define SEN66_VOC_INDEX_OFFSET_REQUESTED    (250)
+#define SEN66_VOC_LEARNING_TIME_OFFSET_HOURS (720)
 #define SEN66_VOC_GAIN_FACTOR_REQUESTED     (1000)
 
 #if defined(CYBSP_CM33_LPTIMER_0)
@@ -249,6 +251,7 @@ static int16_t sen66_apply_voc_tuning(void)
 
     printf("[SEN66] Applying VOC algorithm tuning\r\n");
     printf("[SEN66] VOC index offset requested=%d\r\n", SEN66_VOC_INDEX_OFFSET_REQUESTED);
+    printf("[SEN66] VOC learning-time offset=%d h\r\n", SEN66_VOC_LEARNING_TIME_OFFSET_HOURS);
     printf("[SEN66] VOC gain factor requested=%d\r\n", SEN66_VOC_GAIN_FACTOR_REQUESTED);
 
     error = sen66_stop_measurement();
@@ -278,19 +281,18 @@ static int16_t sen66_apply_voc_tuning(void)
            gating_max_duration_minutes,
            std_initial,
            gain_factor);
-    printf("[SEN66] VOC tuning preserved: learning_time_offset=%d learning_time_gain=%d gating_max_duration=%d std_initial=%d\r\n",
-           learning_time_offset_hours,
+    printf("[SEN66] VOC tuning preserved: learning_time_gain=%d gating_max_duration=%d std_initial=%d\r\n",
            learning_time_gain_hours,
            gating_max_duration_minutes,
            std_initial);
 
     error = sen66_set_voc_algorithm_tuning_parameters(SEN66_VOC_INDEX_OFFSET_REQUESTED,
-                                                      learning_time_offset_hours,
+                                                      SEN66_VOC_LEARNING_TIME_OFFSET_HOURS,
                                                       learning_time_gain_hours,
                                                       gating_max_duration_minutes,
                                                       std_initial,
                                                       SEN66_VOC_GAIN_FACTOR_REQUESTED);
-    printf("[SEN66] VOC tuning write result=%d\r\n", error);
+    printf("[SEN66] VOC tuning result=%d\r\n", error);
     if (NO_ERROR != error)
     {
         return error;
@@ -308,15 +310,18 @@ static int16_t sen66_apply_voc_tuning(void)
         return error;
     }
 
-    printf("[SEN66] VOC tuning readback: index_offset=%d gain_factor=%d\r\n",
+    printf("[SEN66] VOC tuning readback: index_offset=%d learning_time_offset=%d h gain_factor=%d\r\n",
            readback_index_offset,
+           readback_learning_time_offset_hours,
            readback_gain_factor);
 
     if ((SEN66_VOC_INDEX_OFFSET_REQUESTED != readback_index_offset) ||
+        (SEN66_VOC_LEARNING_TIME_OFFSET_HOURS != readback_learning_time_offset_hours) ||
         (SEN66_VOC_GAIN_FACTOR_REQUESTED != readback_gain_factor))
     {
-        printf("[SEN66] VOC tuning verify failed index_offset=%d gain_factor=%d\r\n",
+        printf("[SEN66] VOC tuning verify failed index_offset=%d learning_time_offset=%d gain_factor=%d\r\n",
                readback_index_offset,
+               readback_learning_time_offset_hours,
                readback_gain_factor);
         return -1;
     }
@@ -449,12 +454,15 @@ static void task_sen66_stream(void* arg)
     uint8_t sw1_stable_pressed_count = 0U;
     uint32_t sample_period_ms = SEN66_SAMPLE_PERIOD_DEFAULT_MS;
     uint16_t sequence = 0U;
+    TickType_t previous_sample_tick = 0U;
+    uint8_t sample_interval_log_count = 0U;
 
     set_manual_label(manual_smoking);
     set_distance_cm(0U);
 
     sensirion_i2c_hal_init();
     sen66_init(SEN66_I2C_ADDR_6B);
+    printf("[SEN66] sample interval=%lu ms\r\n", (unsigned long)SEN66_SAMPLE_INTERVAL_MS);
 
     error = sen66_device_reset();
     if (NO_ERROR != error)
@@ -487,9 +495,6 @@ static void task_sen66_stream(void* arg)
         vTaskSuspend(NULL);
     }
 
-    wait_sample_period_and_update_label(&manual_smoking, &sw1_was_pressed,
-                                        &sw1_stable_pressed_count, &sample_period_ms);
-
     for (;;)
     {
         uint16_t pm1p0 = 0U;
@@ -513,9 +518,33 @@ static void task_sen66_stream(void* arg)
         char distance_text[16] = {0};
         char serial_line[APP_SERIAL_LINE_SIZE] = {0};
         uint8_t ble_packet[APP_BLE_IAQ_PACKET_LEN] = {0};
+        uint8_t data_ready_padding = 0U;
+        bool data_ready = false;
+        TickType_t current_sample_tick;
 
         wait_sample_period_and_update_label(&manual_smoking, &sw1_was_pressed,
                                             &sw1_stable_pressed_count, &sample_period_ms);
+
+        error = sen66_get_data_ready(&data_ready_padding, &data_ready);
+        if (NO_ERROR != error)
+        {
+            printf("sen66_data_ready_error:%d\r\n", error);
+            continue;
+        }
+        if (!data_ready)
+        {
+            printf("sen66_data_not_ready\r\n");
+            continue;
+        }
+
+        current_sample_tick = xTaskGetTickCount();
+        if ((0U != previous_sample_tick) && (sample_interval_log_count < 3U))
+        {
+            uint32_t interval_ms = (uint32_t)((current_sample_tick - previous_sample_tick) * portTICK_PERIOD_MS);
+            printf("[SEN66] effective sample interval=%lu ms\r\n", (unsigned long)interval_ms);
+            sample_interval_log_count++;
+        }
+        previous_sample_tick = current_sample_tick;
 
         error = sen66_read_measured_values_as_integers(&pm1p0, &pm2p5, &pm4p0, &pm10p0,
                                                        &humidity, &temperature, &voc, &nox, &co2);
@@ -554,6 +583,8 @@ static void task_sen66_stream(void* arg)
         put_u16_le(ble_packet, 16U, (uint16_t)voc);
         put_u16_le(ble_packet, 18U, co2);
         put_u16_le(ble_packet, 20U, distance_encoded);
+        ble_packet[APP_BLE_IAQ_MANUAL_LABEL_OFFSET] =
+            manual_smoking ? APP_BLE_IAQ_MANUAL_LABEL_SMOKING : APP_BLE_IAQ_MANUAL_LABEL_NO_SMOKING;
 #if defined(DEBUG)
         printf("[BLE] distance encoded=%u unit=mm display_unit=m\r\n",
                (unsigned int)distance_encoded);

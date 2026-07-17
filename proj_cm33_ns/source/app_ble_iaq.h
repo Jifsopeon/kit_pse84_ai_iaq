@@ -7,7 +7,10 @@
 #include "FreeRTOS.h"
 #include "queue.h"
 
-#define APP_BLE_IAQ_PACKET_LEN          (22U)
+#define APP_BLE_IAQ_PACKET_LEN          (23U)
+#define APP_BLE_IAQ_MANUAL_LABEL_OFFSET (22U)
+#define APP_BLE_IAQ_MANUAL_LABEL_NO_SMOKING (0U)
+#define APP_BLE_IAQ_MANUAL_LABEL_SMOKING    (1U)
 
 typedef enum
 {

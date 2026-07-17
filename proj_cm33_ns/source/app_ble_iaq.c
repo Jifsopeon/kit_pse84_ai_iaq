@@ -18,7 +18,9 @@
 #define APP_BLE_DEBUG_ENABLED              (1U)
 #define APP_BLE_DEBUG(fmt, ...)            do { if (APP_BLE_DEBUG_ENABLED) { printf("[BLE] " fmt "\r\n", ##__VA_ARGS__); } } while (0)
 #define APP_BLE_COMMAND_QUEUE_DEPTH        (8U)
-#define APP_BLE_IAQ_LOCAL_ATT_MTU          (25U)
+#define APP_BLE_IAQ_LOCAL_ATT_MTU          (26U)
+#define APP_BLE_ATT_NOTIFICATION_OVERHEAD  (3U)
+#define APP_BLE_IAQ_NOTIFY_VALUE_MAX       (APP_BLE_IAQ_LOCAL_ATT_MTU - APP_BLE_ATT_NOTIFICATION_OVERHEAD)
 #define APP_BLE_GATT_RSP_POOL_BUFFER_SIZE  (32U)
 #define APP_BLE_GATT_RSP_POOL_BUFFER_COUNT (4U)
 #define APP_BLE_GATT_RSP_POOL_OVERHEAD     (0U)
@@ -33,6 +35,58 @@ static bool gatt_response_pool_in_use[APP_BLE_GATT_RSP_POOL_BUFFER_COUNT];
 static uint32_t gatt_response_pool_outstanding;
 static uint32_t gatt_response_pool_high_watermark;
 typedef void (*pfn_free_buffer_t)(uint8_t *);
+
+static const char *app_gatt_status_name(wiced_bt_gatt_status_t status)
+{
+    switch (status)
+    {
+        case WICED_BT_GATT_SUCCESS: return "WICED_BT_GATT_SUCCESS";
+        case WICED_BT_GATT_INVALID_HANDLE: return "WICED_BT_GATT_INVALID_HANDLE";
+        case WICED_BT_GATT_READ_NOT_PERMIT: return "WICED_BT_GATT_READ_NOT_PERMIT";
+        case WICED_BT_GATT_WRITE_NOT_PERMIT: return "WICED_BT_GATT_WRITE_NOT_PERMIT";
+        case WICED_BT_GATT_INVALID_PDU: return "WICED_BT_GATT_INVALID_PDU";
+        case WICED_BT_GATT_INSUF_AUTHENTICATION: return "WICED_BT_GATT_INSUF_AUTHENTICATION";
+        case WICED_BT_GATT_REQ_NOT_SUPPORTED: return "WICED_BT_GATT_REQ_NOT_SUPPORTED";
+        case WICED_BT_GATT_INVALID_OFFSET: return "WICED_BT_GATT_INVALID_OFFSET";
+        case WICED_BT_GATT_INSUF_AUTHORIZATION: return "WICED_BT_GATT_INSUF_AUTHORIZATION";
+        case WICED_BT_GATT_PREPARE_Q_FULL: return "WICED_BT_GATT_PREPARE_Q_FULL";
+        case WICED_BT_GATT_ATTRIBUTE_NOT_FOUND: return "WICED_BT_GATT_ATTRIBUTE_NOT_FOUND";
+        case WICED_BT_GATT_NOT_LONG: return "WICED_BT_GATT_NOT_LONG";
+        case WICED_BT_GATT_INSUF_KEY_SIZE: return "WICED_BT_GATT_INSUF_KEY_SIZE";
+        case WICED_BT_GATT_INVALID_ATTR_LEN: return "WICED_BT_GATT_INVALID_ATTR_LEN";
+        case WICED_BT_GATT_ERR_UNLIKELY: return "WICED_BT_GATT_ERR_UNLIKELY";
+        case WICED_BT_GATT_INSUF_ENCRYPTION: return "WICED_BT_GATT_INSUF_ENCRYPTION";
+        case WICED_BT_GATT_UNSUPPORT_GRP_TYPE: return "WICED_BT_GATT_UNSUPPORT_GRP_TYPE";
+        case WICED_BT_GATT_INSUF_RESOURCE: return "WICED_BT_GATT_INSUF_RESOURCE";
+        case WICED_BT_GATT_DATABASE_OUT_OF_SYNC: return "WICED_BT_GATT_DATABASE_OUT_OF_SYNC";
+        case WICED_BT_GATT_VALUE_NOT_ALLOWED: return "WICED_BT_GATT_VALUE_NOT_ALLOWED";
+        case WICED_BT_GATT_BUSY: return "WICED_BT_GATT_BUSY";
+        case WICED_BT_GATT_CONGESTED: return "WICED_BT_GATT_CONGESTED";
+        case WICED_BT_GATT_INVALID_CONNECTION_ID: return "WICED_BT_GATT_INVALID_CONNECTION_ID";
+        default: return "WICED_BT_GATT_STATUS_UNKNOWN";
+    }
+}
+
+static void app_hex_encode(const uint8_t *data, uint16_t length, char *output, uint16_t output_length)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    uint16_t out = 0U;
+
+    for (uint16_t i = 0U; (i < length) && ((out + 3U) < output_length); i++)
+    {
+        output[out++] = hex[(data[i] >> 4) & 0x0F];
+        output[out++] = hex[data[i] & 0x0F];
+        if ((i + 1U) < length)
+        {
+            output[out++] = ' ';
+        }
+    }
+
+    if (out < output_length)
+    {
+        output[out] = '\0';
+    }
+}
 
 static uint32_t app_gatt_response_pool_free_count(void)
 {
@@ -420,9 +474,10 @@ void app_ble_iaq_init(void)
                   APP_BLE_GATT_RSP_POOL_BUFFER_COUNT,
                   APP_BLE_GATT_RSP_POOL_OVERHEAD,
                   (unsigned long)app_gatt_response_pool_free_count());
-    APP_BLE_DEBUG("BLE config CY_BT_RX_PDU_SIZE=%u local_att_mtu=%u sensor_packet_len=%u",
+    APP_BLE_DEBUG("BLE config CY_BT_RX_PDU_SIZE=%u local_att_mtu=%u max_notification_value_len=%u sensor_packet_len=%u",
                   CY_BT_RX_PDU_SIZE,
                   APP_BLE_IAQ_LOCAL_ATT_MTU,
+                  APP_BLE_IAQ_NOTIFY_VALUE_MAX,
                   APP_BLE_IAQ_PACKET_LEN);
     APP_BLE_DEBUG("stack init start");
     wiced_result_t result = wiced_bt_stack_init(app_bt_management_callback,
@@ -461,30 +516,67 @@ bool app_ble_iaq_is_streaming_enabled(void)
 
 void app_ble_iaq_notify_sensor_packet(const uint8_t packet[APP_BLE_IAQ_PACKET_LEN])
 {
+    char packet_hex[(APP_BLE_IAQ_PACKET_LEN * 3U) + 1U] = {0};
+
     memcpy(app_iaq_sensor_data, packet, APP_BLE_IAQ_PACKET_LEN);
     app_get_attribute(HDLC_IAQ_SENSOR_DATA_VALUE)->cur_len = APP_BLE_IAQ_PACKET_LEN;
+    app_hex_encode(packet, APP_BLE_IAQ_PACKET_LEN, packet_hex, sizeof(packet_hex));
 
     if ((0U != conn_id) &&
         (app_iaq_sensor_data_client_char_config[0] & GATT_CLIENT_CONFIG_NOTIFICATION) &&
         streaming_enabled)
     {
+        APP_BLE_DEBUG("[BLE-TX] ConnectionHandle=%u AttributeHandle=0x%04X NegotiatedAttMtu=%u MaximumNotificationValueLength=%u RequestedValueLength=%u NotificationEnabled=true StreamingEnabled=true Packet=%s ManualLabelRaw=%u",
+                      conn_id,
+                      HDLC_IAQ_SENSOR_DATA_VALUE,
+                      APP_BLE_IAQ_LOCAL_ATT_MTU,
+                      APP_BLE_IAQ_NOTIFY_VALUE_MAX,
+                      APP_BLE_IAQ_PACKET_LEN,
+                      packet_hex,
+                      packet[APP_BLE_IAQ_MANUAL_LABEL_OFFSET]);
         wiced_bt_gatt_status_t status = wiced_bt_gatt_server_send_notification(conn_id,
                                                                                HDLC_IAQ_SENSOR_DATA_VALUE,
                                                                                APP_BLE_IAQ_PACKET_LEN,
                                                                                app_iaq_sensor_data,
                                                                                NULL);
-        APP_BLE_DEBUG("notify sensor len=%u status=%d", APP_BLE_IAQ_PACKET_LEN, status);
+        APP_BLE_DEBUG("notify sensor len=%u raw status=%u symbolic status=%s",
+                      APP_BLE_IAQ_PACKET_LEN,
+                      status,
+                      app_gatt_status_name(status));
     }
     else if (0U == conn_id)
     {
-        APP_BLE_DEBUG("notify skipped: no connection");
+        APP_BLE_DEBUG("[BLE-TX] ConnectionHandle=0 AttributeHandle=0x%04X NegotiatedAttMtu=%u MaximumNotificationValueLength=%u RequestedValueLength=%u NotificationEnabled=%s StreamingEnabled=%s Packet=%s ManualLabelRaw=%u",
+                      HDLC_IAQ_SENSOR_DATA_VALUE,
+                      APP_BLE_IAQ_LOCAL_ATT_MTU,
+                      APP_BLE_IAQ_NOTIFY_VALUE_MAX,
+                      APP_BLE_IAQ_PACKET_LEN,
+                      (app_iaq_sensor_data_client_char_config[0] & GATT_CLIENT_CONFIG_NOTIFICATION) ? "true" : "false",
+                      streaming_enabled ? "true" : "false",
+                      packet_hex,
+                      packet[APP_BLE_IAQ_MANUAL_LABEL_OFFSET]);
     }
     else if (!(app_iaq_sensor_data_client_char_config[0] & GATT_CLIENT_CONFIG_NOTIFICATION))
     {
-        APP_BLE_DEBUG("notify skipped: cccd disabled");
+        APP_BLE_DEBUG("[BLE-TX] ConnectionHandle=%u AttributeHandle=0x%04X NegotiatedAttMtu=%u MaximumNotificationValueLength=%u RequestedValueLength=%u NotificationEnabled=false StreamingEnabled=%s Packet=%s ManualLabelRaw=%u",
+                      conn_id,
+                      HDLC_IAQ_SENSOR_DATA_VALUE,
+                      APP_BLE_IAQ_LOCAL_ATT_MTU,
+                      APP_BLE_IAQ_NOTIFY_VALUE_MAX,
+                      APP_BLE_IAQ_PACKET_LEN,
+                      streaming_enabled ? "true" : "false",
+                      packet_hex,
+                      packet[APP_BLE_IAQ_MANUAL_LABEL_OFFSET]);
     }
     else
     {
-        APP_BLE_DEBUG("notify skipped: streaming disabled");
+        APP_BLE_DEBUG("[BLE-TX] ConnectionHandle=%u AttributeHandle=0x%04X NegotiatedAttMtu=%u MaximumNotificationValueLength=%u RequestedValueLength=%u NotificationEnabled=true StreamingEnabled=false Packet=%s ManualLabelRaw=%u",
+                      conn_id,
+                      HDLC_IAQ_SENSOR_DATA_VALUE,
+                      APP_BLE_IAQ_LOCAL_ATT_MTU,
+                      APP_BLE_IAQ_NOTIFY_VALUE_MAX,
+                      APP_BLE_IAQ_PACKET_LEN,
+                      packet_hex,
+                      packet[APP_BLE_IAQ_MANUAL_LABEL_OFFSET]);
     }
 }
