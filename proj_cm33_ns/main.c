@@ -492,6 +492,7 @@ static void wait_sample_period_and_update_label(bool* manual_smoking, bool* sw1_
     {
         vTaskDelay(pdMS_TO_TICKS(SW1_POLL_PERIOD_MS));
         update_manual_label(manual_smoking, sw1_was_pressed, sw1_stable_pressed_count);
+        app_ble_iaq_process();
         if (drain_ble_commands(manual_smoking, sample_period_ms))
         {
             break;

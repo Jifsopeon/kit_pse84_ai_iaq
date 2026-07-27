@@ -17,6 +17,7 @@ typedef enum
     APP_BLE_IAQ_CMD_IMMEDIATE_SAMPLE = 0x04,
     APP_BLE_IAQ_CMD_SET_DISTANCE_CM = 0x05,
     APP_BLE_IAQ_CMD_SET_MANUAL_LABEL = 0x06,
+    APP_BLE_IAQ_CMD_CLIENT_HEARTBEAT = 0x07,
 } app_ble_iaq_command_id_t;
 
 typedef struct
@@ -29,6 +30,7 @@ typedef struct
 QueueHandle_t app_ble_iaq_get_command_queue(void);
 bool app_ble_iaq_receive_command(app_ble_iaq_command_t *command, TickType_t ticks_to_wait);
 void app_ble_iaq_init(void);
+void app_ble_iaq_process(void);
 void app_ble_iaq_set_streaming_enabled(bool enabled);
 bool app_ble_iaq_is_streaming_enabled(void);
 void app_ble_iaq_notify_sensor_packet(const uint8_t packet[APP_BLE_IAQ_PACKET_LEN]);

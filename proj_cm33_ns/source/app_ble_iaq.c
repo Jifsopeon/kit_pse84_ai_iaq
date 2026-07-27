@@ -24,9 +24,16 @@
 #define APP_BLE_GATT_RSP_POOL_BUFFER_SIZE  (32U)
 #define APP_BLE_GATT_RSP_POOL_BUFFER_COUNT (4U)
 #define APP_BLE_GATT_RSP_POOL_OVERHEAD     (0U)
+#define APP_BLE_HEARTBEAT_TIMEOUT_MS       (35000U)
+#define APP_BLE_HEARTBEAT_CHECK_INTERVAL_MS (1000U)
 
 static uint16_t conn_id;
 static uint16_t negotiated_att_mtu = APP_BLE_IAQ_DEFAULT_ATT_MTU;
+static bool advertising_active;
+static bool client_activity_valid;
+static bool stale_disconnect_requested;
+static TickType_t last_client_activity_tick;
+static TickType_t last_heartbeat_check_tick;
 static QueueHandle_t command_queue;
 static StaticQueue_t command_queue_control;
 static uint8_t command_queue_storage[APP_BLE_COMMAND_QUEUE_DEPTH * sizeof(app_ble_iaq_command_t)];
@@ -36,6 +43,55 @@ static bool gatt_response_pool_in_use[APP_BLE_GATT_RSP_POOL_BUFFER_COUNT];
 static uint32_t gatt_response_pool_outstanding;
 static uint32_t gatt_response_pool_high_watermark;
 typedef void (*pfn_free_buffer_t)(uint8_t *);
+
+static void app_ble_record_client_activity(void)
+{
+    last_client_activity_tick = xTaskGetTickCount();
+    client_activity_valid = true;
+    stale_disconnect_requested = false;
+}
+
+static void app_ble_clear_connection_state(void)
+{
+    conn_id = 0U;
+    negotiated_att_mtu = APP_BLE_IAQ_DEFAULT_ATT_MTU;
+    app_iaq_sensor_data_client_char_config[0] = 0U;
+    app_iaq_sensor_data_client_char_config[1] = 0U;
+    client_activity_valid = false;
+    stale_disconnect_requested = false;
+    if (NULL != command_queue)
+    {
+        (void)xQueueReset(command_queue);
+    }
+}
+
+static void app_ble_start_advertising_if_idle(wiced_bt_ble_advert_mode_t mode)
+{
+    if (0U != conn_id)
+    {
+        return;
+    }
+
+    if (advertising_active)
+    {
+        return;
+    }
+
+    (void)wiced_bt_ble_set_raw_advertisement_data(CY_BT_ADV_PACKET_DATA_SIZE,
+                                                  cy_bt_adv_packet_data);
+    (void)wiced_bt_ble_set_raw_scan_response_data(CY_BT_SCAN_RESP_PACKET_DATA_SIZE,
+                                                  cy_bt_scan_resp_packet_data);
+    wiced_result_t result = wiced_bt_start_advertisements(mode, BLE_ADDR_PUBLIC, NULL);
+    if (WICED_BT_SUCCESS == result)
+    {
+        advertising_active = true;
+        APP_BLE_DEBUG("advertising started");
+    }
+    else
+    {
+        APP_BLE_DEBUG("advertising start failed result=%d", result);
+    }
+}
 
 static uint32_t app_gatt_response_pool_free_count(void)
 {
@@ -255,7 +311,14 @@ static wiced_bt_gatt_status_t app_write_handler(uint16_t conn_id_value,
                         return WICED_BT_GATT_INVALID_PDU;
                     }
                 }
+                else if (APP_BLE_IAQ_CMD_CLIENT_HEARTBEAT == command.id)
+                {
+                    app_ble_record_client_activity();
+                    APP_BLE_DEBUG("heartbeat received");
+                    break;
+                }
 
+                app_ble_record_client_activity();
                 APP_BLE_DEBUG("command write id=0x%02X value=%u bool=%u",
                               (unsigned int)command.id,
                               command.value_u16,
@@ -343,19 +406,21 @@ static wiced_bt_gatt_status_t app_gatt_callback(wiced_bt_gatt_evt_t event,
     switch (event)
     {
         case GATT_CONNECTION_STATUS_EVT:
-            conn_id = data->connection_status.connected ? data->connection_status.conn_id : 0U;
-            negotiated_att_mtu = APP_BLE_IAQ_DEFAULT_ATT_MTU;
             APP_BLE_DEBUG("%s conn_id=%u reason=%u",
                           data->connection_status.connected ? "connected" : "disconnected",
                           data->connection_status.conn_id,
                           data->connection_status.reason);
-            if (!data->connection_status.connected)
+            if (data->connection_status.connected)
             {
-                (void)wiced_bt_ble_set_raw_advertisement_data(CY_BT_ADV_PACKET_DATA_SIZE,
-                                                               cy_bt_adv_packet_data);
-                wiced_result_t adv_result = wiced_bt_start_advertisements(BTM_BLE_ADVERT_UNDIRECTED_LOW,
-                                                                          BLE_ADDR_PUBLIC, NULL);
-                APP_BLE_DEBUG("restart advertising result=%d", adv_result);
+                conn_id = data->connection_status.conn_id;
+                negotiated_att_mtu = APP_BLE_IAQ_DEFAULT_ATT_MTU;
+                advertising_active = false;
+                app_ble_record_client_activity();
+            }
+            else
+            {
+                app_ble_clear_connection_state();
+                app_ble_start_advertising_if_idle(BTM_BLE_ADVERT_UNDIRECTED_LOW);
             }
             return WICED_BT_GATT_SUCCESS;
 
@@ -393,14 +458,13 @@ static void app_ble_start_advertising(void)
                                                                              cy_bt_scan_resp_packet_data);
     wiced_bt_gatt_status_t gatt_register_result = wiced_bt_gatt_register(app_gatt_callback);
     wiced_bt_gatt_status_t gatt_db_result = wiced_bt_gatt_db_init(gatt_database, gatt_database_len, NULL);
-    wiced_result_t adv_start_result = wiced_bt_start_advertisements(BTM_BLE_ADVERT_UNDIRECTED_HIGH,
-                                                                    BLE_ADDR_PUBLIC, NULL);
 
     APP_BLE_DEBUG("set adv data result=%d", adv_data_result);
     APP_BLE_DEBUG("set scan response result=%d", scan_rsp_result);
     APP_BLE_DEBUG("gatt register result=%d", gatt_register_result);
     APP_BLE_DEBUG("gatt db init result=%d len=%u", gatt_db_result, gatt_database_len);
-    APP_BLE_DEBUG("start advertising result=%d name=PSE84-IAQ", adv_start_result);
+    app_ble_start_advertising_if_idle(BTM_BLE_ADVERT_UNDIRECTED_HIGH);
+    APP_BLE_DEBUG("advertising requested name=PSE84-IAQ");
 }
 
 static wiced_result_t app_bt_management_callback(wiced_bt_management_evt_t event,
@@ -464,6 +528,33 @@ bool app_ble_iaq_receive_command(app_ble_iaq_command_t *command, TickType_t tick
            (pdPASS == xQueueReceive(command_queue, command, ticks_to_wait));
 }
 
+void app_ble_iaq_process(void)
+{
+    TickType_t now = xTaskGetTickCount();
+
+    if (0U == conn_id)
+    {
+        return;
+    }
+
+    if ((now - last_heartbeat_check_tick) < pdMS_TO_TICKS(APP_BLE_HEARTBEAT_CHECK_INTERVAL_MS))
+    {
+        return;
+    }
+
+    last_heartbeat_check_tick = now;
+    if (!client_activity_valid ||
+        ((now - last_client_activity_tick) < pdMS_TO_TICKS(APP_BLE_HEARTBEAT_TIMEOUT_MS)) ||
+        stale_disconnect_requested)
+    {
+        return;
+    }
+
+    stale_disconnect_requested = true;
+    APP_BLE_DEBUG("client inactive, disconnecting");
+    wiced_bt_gatt_disconnect(conn_id);
+}
+
 void app_ble_iaq_set_streaming_enabled(bool enabled)
 {
     streaming_enabled = enabled;
@@ -477,6 +568,8 @@ bool app_ble_iaq_is_streaming_enabled(void)
 
 void app_ble_iaq_notify_sensor_packet(const uint8_t packet[APP_BLE_IAQ_PACKET_LEN])
 {
+    app_ble_iaq_process();
+
     memcpy(app_iaq_sensor_data, packet, APP_BLE_IAQ_PACKET_LEN);
     app_get_attribute(HDLC_IAQ_SENSOR_DATA_VALUE)->cur_len = APP_BLE_IAQ_PACKET_LEN;
 
