@@ -45,3 +45,7 @@ MTB_PROJECTS=proj_cm33_s proj_cm33_ns proj_cm55
 include common_app.mk
 
 include $(CY_TOOLS_DIR)/make/application.mk
+
+.PHONY: user_application_postbuild
+user_application_postbuild: recipe_application_postbuild
+	env -u MAKEFLAGS -u MFLAGS -u GNUMAKEFLAGS -u MAKELEVEL -u MAKEOVERRIDES -u MTB_APPLICATION_RECUSIVE $(MAKE) -B -C $(firstword $(MTB_PROJECTS)) sign_combine MTB_APPLICATION_SUBPROJECTS="$(MERGE)"

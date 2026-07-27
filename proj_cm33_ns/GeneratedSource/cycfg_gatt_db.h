@@ -26,7 +26,7 @@
 #define HDLS_IAQ_SERVICE                                      0x0007
 #define HDLC_IAQ_SENSOR_DATA                                  0x0008
 #define HDLC_IAQ_SENSOR_DATA_VALUE                            0x0009
-#define MAX_LEN_IAQ_SENSOR_DATA                               0x0016
+#define MAX_LEN_IAQ_SENSOR_DATA                               0x0017
 #define HDLD_IAQ_SENSOR_DATA_CLIENT_CHAR_CONFIG               0x000A
 #define MAX_LEN_IAQ_SENSOR_DATA_CLIENT_CHAR_CONFIG            0x0002
 

@@ -18,12 +18,15 @@
 #define APP_BLE_DEBUG_ENABLED              (1U)
 #define APP_BLE_DEBUG(fmt, ...)            do { if (APP_BLE_DEBUG_ENABLED) { printf("[BLE] " fmt "\r\n", ##__VA_ARGS__); } } while (0)
 #define APP_BLE_COMMAND_QUEUE_DEPTH        (8U)
-#define APP_BLE_IAQ_LOCAL_ATT_MTU          (25U)
+#define APP_BLE_IAQ_LOCAL_ATT_MTU          (32U)
+#define APP_BLE_IAQ_DEFAULT_ATT_MTU        (23U)
+#define APP_BLE_IAQ_REQUIRED_ATT_MTU       (APP_BLE_IAQ_PACKET_LEN + 3U)
 #define APP_BLE_GATT_RSP_POOL_BUFFER_SIZE  (32U)
 #define APP_BLE_GATT_RSP_POOL_BUFFER_COUNT (4U)
 #define APP_BLE_GATT_RSP_POOL_OVERHEAD     (0U)
 
 static uint16_t conn_id;
+static uint16_t negotiated_att_mtu = APP_BLE_IAQ_DEFAULT_ATT_MTU;
 static QueueHandle_t command_queue;
 static StaticQueue_t command_queue_control;
 static uint8_t command_queue_storage[APP_BLE_COMMAND_QUEUE_DEPTH * sizeof(app_ble_iaq_command_t)];
@@ -242,6 +245,17 @@ static wiced_bt_gatt_status_t app_write_handler(uint16_t conn_id_value,
                     command.value_bool = (0U != write_data->p_val[1]);
                 }
 
+                if (APP_BLE_IAQ_CMD_SET_MANUAL_LABEL == command.id)
+                {
+                    if ((write_data->val_len < 2U) || (write_data->p_val[1] > 1U))
+                    {
+                        APP_BLE_DEBUG("manual label command rejected raw=%u len=%u",
+                                      (write_data->val_len >= 2U) ? write_data->p_val[1] : 0U,
+                                      write_data->val_len);
+                        return WICED_BT_GATT_INVALID_PDU;
+                    }
+                }
+
                 APP_BLE_DEBUG("command write id=0x%02X value=%u bool=%u",
                               (unsigned int)command.id,
                               command.value_u16,
@@ -301,6 +315,7 @@ static wiced_bt_gatt_status_t app_attribute_request_handler(wiced_bt_gatt_attrib
             uint16_t local_mtu = APP_BLE_IAQ_LOCAL_ATT_MTU;
             uint16_t negotiated_mtu = (request->data.remote_mtu < local_mtu) ?
                                       request->data.remote_mtu : local_mtu;
+            negotiated_att_mtu = negotiated_mtu;
             APP_BLE_DEBUG("MTU request: remote=%u local=%u negotiated=%u",
                           request->data.remote_mtu,
                           local_mtu,
@@ -329,6 +344,7 @@ static wiced_bt_gatt_status_t app_gatt_callback(wiced_bt_gatt_evt_t event,
     {
         case GATT_CONNECTION_STATUS_EVT:
             conn_id = data->connection_status.connected ? data->connection_status.conn_id : 0U;
+            negotiated_att_mtu = APP_BLE_IAQ_DEFAULT_ATT_MTU;
             APP_BLE_DEBUG("%s conn_id=%u reason=%u",
                           data->connection_status.connected ? "connected" : "disconnected",
                           data->connection_status.conn_id,
@@ -468,12 +484,21 @@ void app_ble_iaq_notify_sensor_packet(const uint8_t packet[APP_BLE_IAQ_PACKET_LE
         (app_iaq_sensor_data_client_char_config[0] & GATT_CLIENT_CONFIG_NOTIFICATION) &&
         streaming_enabled)
     {
-        wiced_bt_gatt_status_t status = wiced_bt_gatt_server_send_notification(conn_id,
-                                                                               HDLC_IAQ_SENSOR_DATA_VALUE,
-                                                                               APP_BLE_IAQ_PACKET_LEN,
-                                                                               app_iaq_sensor_data,
-                                                                               NULL);
-        APP_BLE_DEBUG("notify sensor len=%u status=%d", APP_BLE_IAQ_PACKET_LEN, status);
+        if (negotiated_att_mtu >= APP_BLE_IAQ_REQUIRED_ATT_MTU)
+        {
+            wiced_bt_gatt_status_t status = wiced_bt_gatt_server_send_notification(conn_id,
+                                                                                   HDLC_IAQ_SENSOR_DATA_VALUE,
+                                                                                   APP_BLE_IAQ_PACKET_LEN,
+                                                                                   app_iaq_sensor_data,
+                                                                                   NULL);
+            APP_BLE_DEBUG("notify sensor len=%u status=%d", APP_BLE_IAQ_PACKET_LEN, status);
+        }
+        else
+        {
+            APP_BLE_DEBUG("notify skipped: mtu too small negotiated=%u required=%u",
+                          negotiated_att_mtu,
+                          APP_BLE_IAQ_REQUIRED_ATT_MTU);
+        }
     }
     else if (0U == conn_id)
     {

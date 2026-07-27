@@ -17,9 +17,13 @@
 #include "sensirion_common.h"
 #include "sensirion_i2c_hal.h"
 #include "app_ble_iaq.h"
+#include "app_radar.h"
 
+#include <math.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #define CM55_BOOT_WAIT_TIME_USEC            (10U)
 #define CM55_APP_BOOT_ADDR                  (CYMEM_CM33_0_m55_nvm_START + CYBSP_MCUBOOT_HEADER_SIZE)
@@ -29,6 +33,9 @@
 #define DEBUG_UART_BAUDRATE                 (115200U)
 #define SEN66_TASK_PRIORITY                 (configMAX_PRIORITIES - 1U)
 #define SEN66_TASK_STACK_SIZE               (2048U)
+#define RADAR_TASK_PRIORITY                 (tskIDLE_PRIORITY + 1U)
+#define RADAR_TASK_STACK_SIZE               (4096U)
+#define RADAR_TASK_PERIOD_MS                (20U)
 #define SEN66_STARTUP_DELAY_MS              (1200U)
 #define SEN66_SAMPLE_PERIOD_DEFAULT_MS      (1000U)
 #define SEN66_SAMPLE_PERIOD_MIN_MS          (1000U)
@@ -39,8 +46,20 @@
 #define MANUAL_LABEL_SMOKING                "smoking"
 #define APP_DISTANCE_MAX_CM                 (500U)
 #define APP_SERIAL_LINE_SIZE                (384U)
+#define APP_BLE_DISTANCE_OFFSET             (20U)
+#define APP_BLE_MANUAL_LABEL_OFFSET         (22U)
+#define APP_BLE_MANUAL_LABEL_NO_SMOKING     (0U)
+#define APP_BLE_MANUAL_LABEL_SMOKING        (1U)
 #define SEN66_VOC_INDEX_OFFSET_REQUESTED    (250)
 #define SEN66_VOC_GAIN_FACTOR_REQUESTED     (1000)
+
+#if (APP_BLE_DISTANCE_OFFSET + 2U) != APP_BLE_MANUAL_LABEL_OFFSET
+#error "BLE radar distance field must end immediately before the manual label byte"
+#endif
+
+#if (APP_BLE_MANUAL_LABEL_OFFSET + 1U) != APP_BLE_IAQ_PACKET_LEN
+#error "BLE manual label byte must be the final IAQ packet field"
+#endif
 
 #if defined(CYBSP_CM33_LPTIMER_0)
 static mtb_hal_lptimer_t lptimer_obj;
@@ -55,6 +74,11 @@ static mtb_hal_uart_t debug_uart_obj;
 
 static volatile bool app_manual_smoking = false;
 static volatile uint16_t app_distance_cm = 0U;
+
+static bool distance_m_is_valid(float distance_m)
+{
+    return isfinite(distance_m) && (distance_m > 0.0f);
+}
 
 static void put_u16_le(uint8_t *buffer, uint16_t offset, uint16_t value)
 {
@@ -163,19 +187,51 @@ static void setup_tickless_idle_timer(void)
 }
 #endif
 
-static void format_unsigned_distance_m(uint16_t distance_cm, char* buffer, size_t buffer_size)
+static void format_distance_slot_m(float distance_m, char* buffer, size_t buffer_size)
 {
-    uint16_t meters = (uint16_t)(distance_cm / 100U);
-    uint16_t centimeters = (uint16_t)(distance_cm % 100U);
+    if ((NULL == buffer) || (0U == buffer_size))
+    {
+        return;
+    }
 
-    if (0U == distance_cm)
+    if (!distance_m_is_valid(distance_m))
     {
         snprintf(buffer, buffer_size, "0");
+        return;
     }
-    else
+
+    uint32_t distance_hundredths_m = (uint32_t)((distance_m * 100.0f) + 0.5f);
+    snprintf(buffer, buffer_size, "%lu.%02lu",
+             (unsigned long)(distance_hundredths_m / 100U),
+             (unsigned long)(distance_hundredths_m % 100U));
+}
+
+static uint16_t radar_distance_m_to_mm(float distance_m)
+{
+    if (!distance_m_is_valid(distance_m))
     {
-        snprintf(buffer, buffer_size, "%u.%02u", meters, centimeters);
+        return 0U;
     }
+
+    float distance_mm = distance_m * 1000.0f;
+    if (distance_mm >= (float)UINT16_MAX)
+    {
+        return UINT16_MAX;
+    }
+
+    return (uint16_t)(distance_mm + 0.5f);
+}
+
+static void put_radar_distance_le(uint8_t *buffer, float distance_m)
+{
+    /* Radar distance field:
+     *
+     * Bytes 20-21: selected presence distance, uint16_t millimetres, little-endian.
+     *
+     * A value of 0 means that no valid presence distance exists.
+     * Values are displayed to users in metres.
+     */
+    put_u16_le(buffer, APP_BLE_DISTANCE_OFFSET, radar_distance_m_to_mm(distance_m));
 }
 
 static void format_u16_scaled_1(uint16_t value, char* buffer, size_t buffer_size)
@@ -327,9 +383,15 @@ static int16_t sen66_apply_voc_tuning(void)
 
 void set_manual_label(bool manual_smoking)
 {
+    bool previous_manual_smoking = app_manual_smoking;
     app_manual_smoking = manual_smoking;
     Cy_GPIO_Write(CYBSP_USER_LED1_PORT, CYBSP_USER_LED1_PIN,
                   manual_smoking ? CYBSP_LED_STATE_ON : CYBSP_LED_STATE_OFF);
+    if (previous_manual_smoking != manual_smoking)
+    {
+        printf("[LABEL] value=%s\r\n",
+               manual_smoking ? MANUAL_LABEL_SMOKING : MANUAL_LABEL_NO_SMOKING);
+    }
 }
 
 void set_distance_cm(uint16_t distance_cm)
@@ -501,7 +563,6 @@ static void task_sen66_stream(void* arg)
         int16_t voc = 0;
         int16_t nox = 0;
         uint16_t co2 = 0U;
-        uint16_t distance_encoded = 0U;
         char pm1p0_text[16] = {0};
         char pm2p5_text[16] = {0};
         char pm4p0_text[16] = {0};
@@ -525,6 +586,12 @@ static void task_sen66_stream(void* arg)
             continue;
         }
 
+        const radar_result_t *radar_result = radar_get_latest_result();
+        float radar_distance_m = ((NULL != radar_result) &&
+                                  radar_result->presence_detected &&
+                                  radar_result->distance_valid) ?
+                                 radar_result->distance_m : 0.0f;
+
         manual_smoking = app_manual_smoking;
         format_u16_scaled_1(pm1p0, pm1p0_text, sizeof(pm1p0_text));
         format_u16_scaled_1(pm2p5, pm2p5_text, sizeof(pm2p5_text));
@@ -534,7 +601,7 @@ static void task_sen66_stream(void* arg)
         format_i16_scaled_2(temperature, 200, temperature_text, sizeof(temperature_text));
         format_i16_scaled_1(voc, voc_text, sizeof(voc_text));
         format_i16_scaled_1(nox, nox_text, sizeof(nox_text));
-        format_unsigned_distance_m(0U, distance_text, sizeof(distance_text));
+        format_distance_slot_m(radar_distance_m, distance_text, sizeof(distance_text));
 
         snprintf(serial_line, sizeof(serial_line),
                  "PM1.0: %s  PM2.5: %s  PM4.0: %s  PM10.0: %s  Humidity: %s  Temperature: %s  VOC: %s  NOx: %s  CO2: %u  Distance: %s  Manual Label: %s\r\n",
@@ -553,12 +620,35 @@ static void task_sen66_stream(void* arg)
         put_u16_le(ble_packet, 14U, (uint16_t)nox);
         put_u16_le(ble_packet, 16U, (uint16_t)voc);
         put_u16_le(ble_packet, 18U, co2);
-        put_u16_le(ble_packet, 20U, distance_encoded);
-#if defined(DEBUG)
-        printf("[BLE] distance encoded=%u unit=mm display_unit=m\r\n",
-               (unsigned int)distance_encoded);
-#endif
+        put_radar_distance_le(ble_packet, radar_distance_m);
+        ble_packet[APP_BLE_MANUAL_LABEL_OFFSET] = manual_smoking ?
+                                                  APP_BLE_MANUAL_LABEL_SMOKING :
+                                                  APP_BLE_MANUAL_LABEL_NO_SMOKING;
         app_ble_iaq_notify_sensor_packet(ble_packet);
+    }
+}
+
+static void task_radar(void* arg)
+{
+    CY_UNUSED_PARAMETER(arg);
+
+    cy_rslt_t result = radar_init();
+    if (CY_RSLT_SUCCESS == result)
+    {
+        result = radar_start();
+    }
+
+    if (CY_RSLT_SUCCESS != result)
+    {
+        printf("[RADAR] disabled result=0x%08lx; continuing without radar\r\n",
+               (unsigned long)result);
+        vTaskSuspend(NULL);
+    }
+
+    for (;;)
+    {
+        (void)radar_process();
+        vTaskDelay(pdMS_TO_TICKS(RADAR_TASK_PERIOD_MS));
     }
 }
 
@@ -590,6 +680,12 @@ int main(void)
                               NULL, SEN66_TASK_PRIORITY, NULL))
     {
         handle_app_error();
+    }
+
+    if (pdPASS != xTaskCreate(task_radar, "RADAR", RADAR_TASK_STACK_SIZE,
+                              NULL, RADAR_TASK_PRIORITY, NULL))
+    {
+        printf("[RADAR] task create failed; continuing without radar\r\n");
     }
 
     vTaskStartScheduler();
