@@ -54,6 +54,14 @@ typedef struct
     float filtered_distance_m;
 } radar_selected_target_state_t;
 
+typedef struct
+{
+    uint16_t checksum;
+    uint16_t minimum;
+    uint16_t maximum;
+    uint32_t nonzero_count;
+} radar_frame_stats_t;
+
 static cy_stc_scb_spi_context_t radar_spi_context;
 static xensiv_bgt60trxx_mtb_t radar_device;
 static xensiv_radar_presence_handle_t presence_handle;
@@ -75,10 +83,14 @@ static uint16_t max_range_bin;
 static uint16_t leakage_reject_bin;
 static uint32_t absence_frames;
 static uint32_t stale_frame_polls;
+static uint32_t consecutive_invalid_frames;
 static uint8_t previous_target_count;
 static bool motion_presence_detected;
 static bool last_presence_state;
 static bool presence_state_reported;
+static TickType_t last_frame_tick;
+static TickType_t last_check_log_tick;
+static TickType_t last_watchdog_log_tick;
 
 static void radar_spi_interrupt_handler(void)
 {
@@ -90,6 +102,43 @@ static bool distance_is_plausible(float distance_m)
     return isfinite(distance_m) &&
            (distance_m >= APP_RADAR_MIN_DISTANCE_M) &&
            (distance_m <= APP_RADAR_MAX_DISTANCE_M);
+}
+
+static const char *radar_state_name(radar_state_t state)
+{
+    switch (state)
+    {
+        case RADAR_STATE_STOPPED:
+            return "STOPPED";
+        case RADAR_STATE_STARTING:
+            return "STARTING";
+        case RADAR_STATE_WAIT_FIFO:
+            return "WAIT_FIFO";
+        case RADAR_STATE_READING_FIFO:
+            return "READING_FIFO";
+        case RADAR_STATE_VALIDATING_FRAME:
+            return "VALIDATING_FRAME";
+        case RADAR_STATE_PROCESSING_FRAME:
+            return "PROCESSING_FRAME";
+        case RADAR_STATE_RECOVERING:
+            return "RECOVERING";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+static void set_radar_state(radar_state_t state)
+{
+    latest_result.state = state;
+}
+
+static uint32_t get_radar_task_stack_high_water_words(void)
+{
+#if (INCLUDE_uxTaskGetStackHighWaterMark == 1)
+    return (uint32_t)uxTaskGetStackHighWaterMark(NULL);
+#else
+    return 0U;
+#endif
 }
 
 static uint16_t clamp_bin(int32_t bin)
@@ -384,8 +433,34 @@ static void copy_current_targets(const radar_target_t *targets, uint8_t target_c
 
 static void clear_published_distance(void)
 {
+    taskENTER_CRITICAL();
     latest_result.distance_valid = false;
     latest_result.distance_m = 0.0f;
+    taskEXIT_CRITICAL();
+}
+
+static void publish_presence_distance(bool presence_detected, bool distance_valid, float distance_m)
+{
+    taskENTER_CRITICAL();
+    latest_result.presence_detected = presence_detected;
+    latest_result.distance_valid = distance_valid;
+    latest_result.distance_m = distance_valid ? distance_m : 0.0f;
+    latest_result.frame_generation++;
+    if (distance_valid)
+    {
+        latest_result.last_valid_timestamp_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    }
+    taskEXIT_CRITICAL();
+}
+
+static void reset_tracking_state(void)
+{
+    selected_state.valid = false;
+    selected_state.missed_frames = 0U;
+    previous_target_count = 0U;
+    absence_frames = 0U;
+    motion_presence_detected = false;
+    publish_presence_distance(false, false, 0.0f);
 }
 
 static void update_selected_distance(const radar_target_t *targets, uint8_t target_count)
@@ -434,9 +509,7 @@ static void update_selected_distance(const radar_target_t *targets, uint8_t targ
     }
 
     selected_state.missed_frames = 0U;
-    latest_result.presence_detected = true;
-    latest_result.distance_valid = true;
-    latest_result.distance_m = selected_state.filtered_distance_m;
+    publish_presence_distance(true, true, selected_state.filtered_distance_m);
     absence_frames = 0U;
 }
 
@@ -518,10 +591,163 @@ static void invalidate_after_absence(void)
         if (absence_frames >= APP_RADAR_ABSENCE_RESET_FRAMES)
         {
             selected_state.valid = false;
-            latest_result.presence_detected = false;
-            clear_published_distance();
+            publish_presence_distance(false, false, 0.0f);
         }
     }
+}
+
+static radar_frame_stats_t analyze_raw_frame(void)
+{
+    radar_frame_stats_t stats =
+    {
+        .checksum = 0U,
+        .minimum = UINT16_MAX,
+        .maximum = 0U,
+        .nonzero_count = 0U,
+    };
+
+    for (uint32_t i = 0U; i < APP_RADAR_FRAME_SAMPLES; i++)
+    {
+        uint16_t sample = radar_raw_frame[i];
+        stats.checksum = (uint16_t)((stats.checksum << 1U) ^ sample);
+        if (sample < stats.minimum)
+        {
+            stats.minimum = sample;
+        }
+        if (sample > stats.maximum)
+        {
+            stats.maximum = sample;
+        }
+        if (0U != sample)
+        {
+            stats.nonzero_count++;
+        }
+    }
+
+    return stats;
+}
+
+static bool frame_stats_are_valid(const radar_frame_stats_t *stats)
+{
+    uint16_t span = (uint16_t)(stats->maximum - stats->minimum);
+
+    return (stats->nonzero_count >= APP_RADAR_MIN_NONZERO_SAMPLES) &&
+           (span >= APP_RADAR_MIN_RAW_SPAN);
+}
+
+static cy_rslt_t reinitialize_radar_stream(const char *reason);
+
+static cy_rslt_t restart_radar_fifo_stream(const char *reason)
+{
+    int32_t reset_status;
+    int32_t start_status;
+
+    set_radar_state(RADAR_STATE_RECOVERING);
+    latest_result.fifo_recovery_count++;
+    reset_tracking_state();
+
+    (void)xensiv_bgt60trxx_start_frame(&radar_device.dev, false);
+    reset_status = xensiv_bgt60trxx_soft_reset(&radar_device.dev, XENSIV_BGT60TRXX_RESET_FIFO);
+    Cy_GPIO_ClearInterrupt(CYBSP_RADAR_INT_PORT, CYBSP_RADAR_INT_PIN);
+    start_status = xensiv_bgt60trxx_start_frame(&radar_device.dev, true);
+    stale_frame_polls = 0U;
+    consecutive_invalid_frames = 0U;
+
+    if ((XENSIV_BGT60TRXX_STATUS_OK != reset_status) ||
+        (XENSIV_BGT60TRXX_STATUS_OK != start_status))
+    {
+        latest_result.acquisition_error_count++;
+        latest_result.running = false;
+        RADAR_LOG("stream recovery failed reason=%s reset=%ld start=%ld recoveries=%lu",
+                  reason,
+                  (long)reset_status,
+                  (long)start_status,
+                  (unsigned long)latest_result.fifo_recovery_count);
+        if ((latest_result.fifo_recovery_count % APP_RADAR_REINIT_RECOVERY_LIMIT) == 0U)
+        {
+            return reinitialize_radar_stream(reason);
+        }
+        return RADAR_RSLT_ERR;
+    }
+
+    latest_result.running = true;
+    last_frame_tick = xTaskGetTickCount();
+    set_radar_state(RADAR_STATE_WAIT_FIFO);
+    RADAR_LOG("stream recovered reason=%s recoveries=%lu",
+              reason,
+              (unsigned long)latest_result.fifo_recovery_count);
+    return CY_RSLT_SUCCESS;
+}
+
+static cy_rslt_t reinitialize_radar_stream(const char *reason)
+{
+    cy_rslt_t result;
+
+    set_radar_state(RADAR_STATE_RECOVERING);
+    latest_result.reinit_recovery_count++;
+    latest_result.running = false;
+    reset_tracking_state();
+
+    (void)xensiv_bgt60trxx_start_frame(&radar_device.dev, false);
+    result = xensiv_bgt60trxx_mtb_init(&radar_device,
+                                       app_radar_register_list,
+                                       APP_RADAR_REGISTER_COUNT);
+    if (CY_RSLT_SUCCESS == result)
+    {
+        result = xensiv_bgt60trxx_mtb_interrupt_init(&radar_device,
+                                                     APP_RADAR_FIFO_LIMIT_SAMPLES);
+    }
+    if (CY_RSLT_SUCCESS == result)
+    {
+        result = radar_start();
+    }
+
+    RADAR_LOG("reinit recovery reason=%s result=0x%08lx reinit=%lu",
+              reason,
+              (unsigned long)result,
+              (unsigned long)latest_result.reinit_recovery_count);
+    return result;
+}
+
+static void log_radar_liveness(uint16_t peak_bin,
+                               float raw_distance_m,
+                               float filtered_distance_m,
+                               bool distance_valid,
+                               uint8_t candidate_count,
+                               uint8_t confirmed_count,
+                               uint16_t raw_checksum)
+{
+    TickType_t now = xTaskGetTickCount();
+
+    if ((now - last_check_log_tick) < pdMS_TO_TICKS(1000U))
+    {
+        return;
+    }
+
+    last_check_log_tick = now;
+    latest_result.task_stack_high_water_words = get_radar_task_stack_high_water_words();
+    RADAR_LOG("CHECK loop=%lu frame=%lu fifo_ready=%lu fifo_read=%lu recover=%lu reinit=%lu abort=%lu invalid=%lu zero=%lu age_ms=%lu state=%s stack=%lu peak=%u raw=%.2f filtered=%.2f valid=%u presence=%u candidates=%u confirmed=%u missed=%u checksum=0x%04X",
+              (unsigned long)latest_result.task_loop_counter,
+              (unsigned long)latest_result.frame_counter,
+              (unsigned long)latest_result.fifo_ready_count,
+              (unsigned long)latest_result.fifo_read_count,
+              (unsigned long)latest_result.fifo_recovery_count,
+              (unsigned long)latest_result.reinit_recovery_count,
+              (unsigned long)latest_result.spi_abort_count,
+              (unsigned long)latest_result.invalid_frame_count,
+              (unsigned long)latest_result.zero_frame_count,
+              (unsigned long)((now - last_frame_tick) * portTICK_PERIOD_MS),
+              radar_state_name(latest_result.state),
+              (unsigned long)latest_result.task_stack_high_water_words,
+              (unsigned int)peak_bin,
+              (double)raw_distance_m,
+              (double)filtered_distance_m,
+              distance_valid ? 1U : 0U,
+              latest_result.presence_detected ? 1U : 0U,
+              (unsigned int)candidate_count,
+              (unsigned int)confirmed_count,
+              (unsigned int)selected_state.missed_frames,
+              (unsigned int)raw_checksum);
 }
 
 cy_rslt_t radar_init(void)
@@ -632,6 +858,10 @@ cy_rslt_t radar_init(void)
     xensiv_radar_presence_set_callback(presence_handle, presence_callback, NULL);
 
     latest_result.initialized = true;
+    last_frame_tick = xTaskGetTickCount();
+    last_check_log_tick = last_frame_tick;
+    last_watchdog_log_tick = last_frame_tick;
+    set_radar_state(RADAR_STATE_STOPPED);
     RADAR_LOG("initialized BGT60TR13C frame_samples=%u fft=%u bin=%.3f m min_bin=%u max_bin=%u leakage_bin=%u",
               (unsigned int)APP_RADAR_FRAME_SAMPLES,
               (unsigned int)APP_RADAR_RANGE_FFT_SIZE,
@@ -650,6 +880,7 @@ cy_rslt_t radar_start(void)
         return RADAR_RSLT_ERR;
     }
 
+    set_radar_state(RADAR_STATE_STARTING);
     if (XENSIV_BGT60TRXX_STATUS_OK !=
         xensiv_bgt60trxx_soft_reset(&radar_device.dev, XENSIV_BGT60TRXX_RESET_FIFO))
     {
@@ -666,6 +897,11 @@ cy_rslt_t radar_start(void)
     }
 
     latest_result.running = true;
+    stale_frame_polls = 0U;
+    consecutive_invalid_frames = 0U;
+    reset_tracking_state();
+    last_frame_tick = xTaskGetTickCount();
+    set_radar_state(RADAR_STATE_WAIT_FIFO);
     RADAR_LOG("started");
     return CY_RSLT_SUCCESS;
 }
@@ -674,30 +910,44 @@ cy_rslt_t radar_process(void)
 {
     if (!latest_result.running)
     {
+        set_radar_state(RADAR_STATE_STOPPED);
         return RADAR_RSLT_ERR;
     }
 
+    latest_result.task_loop_counter++;
+    latest_result.task_stack_high_water_words = get_radar_task_stack_high_water_words();
+    set_radar_state(RADAR_STATE_WAIT_FIFO);
+
     if (0U == Cy_GPIO_Read(CYBSP_RADAR_INT_PORT, CYBSP_RADAR_INT_PIN))
     {
-        if (stale_frame_polls < APP_RADAR_STALE_FRAME_POLLS)
+        if (stale_frame_polls < APP_RADAR_STALE_RECOVERY_POLLS)
         {
             stale_frame_polls++;
         }
         if (stale_frame_polls >= APP_RADAR_STALE_FRAME_POLLS)
         {
-            selected_state.valid = false;
-            latest_result.presence_detected = false;
-            clear_published_distance();
+            reset_tracking_state();
+            if (stale_frame_polls >= APP_RADAR_STALE_RECOVERY_POLLS)
+            {
+                return restart_radar_fifo_stream("stale_fifo_ready");
+            }
         }
         invalidate_after_absence();
+        log_radar_liveness(0U, 0.0f, 0.0f, false, 0U, 0U, 0U);
         return CY_RSLT_SUCCESS;
     }
     stale_frame_polls = 0U;
+    latest_result.fifo_ready_count++;
 
+    uint32_t fifo_status_before = 0U;
+    (void)xensiv_bgt60trxx_get_fifo_status(&radar_device.dev, &fifo_status_before);
+    set_radar_state(RADAR_STATE_READING_FIFO);
     int32_t status = xensiv_bgt60trxx_get_fifo_data(&radar_device.dev,
                                                     radar_raw_frame,
                                                     APP_RADAR_FRAME_SAMPLES);
     Cy_GPIO_ClearInterrupt(CYBSP_RADAR_INT_PORT, CYBSP_RADAR_INT_PIN);
+    uint32_t fifo_status_after = 0U;
+    (void)xensiv_bgt60trxx_get_fifo_status(&radar_device.dev, &fifo_status_after);
 
     if (XENSIV_BGT60TRXX_STATUS_OK != status)
     {
@@ -707,11 +957,44 @@ cy_rslt_t radar_process(void)
         return RADAR_RSLT_ERR;
     }
 
+    set_radar_state(RADAR_STATE_VALIDATING_FRAME);
+    radar_frame_stats_t frame_stats = analyze_raw_frame();
+    if (!frame_stats_are_valid(&frame_stats))
+    {
+        latest_result.invalid_frame_count++;
+        if (0U == frame_stats.nonzero_count)
+        {
+            latest_result.zero_frame_count++;
+        }
+        consecutive_invalid_frames++;
+        reset_tracking_state();
+        RADAR_LOG("IO invalid_frame fifo_before=0x%06lX fifo_after=0x%06lX requested_samples=%u requested_bytes=%u buffer=0x%08lX min=%u max=%u nonzero=%lu checksum=0x%04X consecutive=%lu",
+                  (unsigned long)fifo_status_before,
+                  (unsigned long)fifo_status_after,
+                  (unsigned int)APP_RADAR_FRAME_SAMPLES,
+                  (unsigned int)(APP_RADAR_FRAME_SAMPLES * sizeof(radar_raw_frame[0])),
+                  (unsigned long)(uintptr_t)radar_raw_frame,
+                  (unsigned int)frame_stats.minimum,
+                  (unsigned int)frame_stats.maximum,
+                  (unsigned long)frame_stats.nonzero_count,
+                  (unsigned int)frame_stats.checksum,
+                  (unsigned long)consecutive_invalid_frames);
+        if (consecutive_invalid_frames >= APP_RADAR_INVALID_FRAME_RECOVERY_COUNT)
+        {
+            return restart_radar_fifo_stream("invalid_frame");
+        }
+        return CY_RSLT_SUCCESS;
+    }
+
+    consecutive_invalid_frames = 0U;
+    latest_result.fifo_read_count++;
+    last_frame_tick = xTaskGetTickCount();
     for (uint32_t i = 0U; i < APP_RADAR_FRAME_SAMPLES; i++)
     {
         radar_float_frame[i] = (float32_t)((int16_t)radar_raw_frame[i]);
     }
 
+    set_radar_state(RADAR_STATE_PROCESSING_FRAME);
     build_range_profile();
 
     int32_t presence_status = xensiv_radar_presence_process_frame(presence_handle,
@@ -746,6 +1029,21 @@ cy_rslt_t radar_process(void)
     radar_target_t candidate_targets[RADAR_INTERNAL_MAX_CANDIDATES];
     uint8_t candidate_count = find_candidate_targets(candidate_targets, RADAR_INTERNAL_MAX_CANDIDATES);
     uint8_t confirmed_count = confirm_targets(candidate_targets, candidate_count);
+    uint16_t raw_peak_bin = 0U;
+    float raw_distance_m = 0.0f;
+    if (confirmed_count > 0U)
+    {
+        const radar_target_t *nearest = &candidate_targets[0];
+        for (uint8_t i = 1U; i < confirmed_count; i++)
+        {
+            if (candidate_targets[i].distance_m < nearest->distance_m)
+            {
+                nearest = &candidate_targets[i];
+            }
+        }
+        raw_peak_bin = nearest->peak_bin;
+        raw_distance_m = nearest->distance_m;
+    }
 
     latest_result.frame_counter++;
     update_selected_distance(candidate_targets, confirmed_count);
@@ -762,13 +1060,80 @@ cy_rslt_t radar_process(void)
 #if APP_RADAR_VERBOSE_DIAGNOSTICS
     log_range_diagnostics(candidate_targets, confirmed_count);
 #endif
+    log_radar_liveness(raw_peak_bin,
+                       raw_distance_m,
+                       latest_result.distance_m,
+                       latest_result.distance_valid,
+                       candidate_count,
+                       confirmed_count,
+                       frame_stats.checksum);
+    set_radar_state(RADAR_STATE_WAIT_FIFO);
 
     return CY_RSLT_SUCCESS;
 }
 
-const radar_result_t *radar_get_latest_result(void)
+void radar_get_latest_result(radar_result_t *result)
 {
-    return &latest_result;
+    if (NULL == result)
+    {
+        return;
+    }
+
+    TickType_t now = xTaskGetTickCount();
+    TickType_t frame_tick;
+
+    taskENTER_CRITICAL();
+    *result = latest_result;
+    frame_tick = last_frame_tick;
+    taskEXIT_CRITICAL();
+
+    result->last_frame_age_ms = (uint32_t)((now - frame_tick) * portTICK_PERIOD_MS);
+}
+
+void radar_log_watchdog(void)
+{
+#if APP_RADAR_DIAGNOSTICS_ENABLED
+    TickType_t now = xTaskGetTickCount();
+
+    if ((now - last_watchdog_log_tick) < pdMS_TO_TICKS(APP_RADAR_WATCHDOG_PERIOD_MS))
+    {
+        return;
+    }
+
+    if ((now - last_check_log_tick) < pdMS_TO_TICKS(APP_RADAR_WATCHDOG_PERIOD_MS))
+    {
+        return;
+    }
+
+    last_watchdog_log_tick = now;
+
+    radar_result_t snapshot;
+    radar_get_latest_result(&snapshot);
+    if ((RADAR_STATE_READING_FIFO == snapshot.state) &&
+        (snapshot.last_frame_age_ms >= APP_RADAR_SPI_STALL_ABORT_MS))
+    {
+        latest_result.spi_abort_count++;
+        Cy_SCB_SPI_AbortTransfer(CYBSP_SPI_CONTROLLER_HW, &radar_spi_context);
+        Cy_GPIO_ClearInterrupt(CYBSP_RADAR_INT_PORT, CYBSP_RADAR_INT_PIN);
+        RADAR_LOG("WATCH abort_spi age_ms=%lu abort=%lu",
+                  (unsigned long)snapshot.last_frame_age_ms,
+                  (unsigned long)latest_result.spi_abort_count);
+    }
+
+    RADAR_LOG("WATCH loop=%lu frame=%lu fifo_ready=%lu fifo_read=%lu recover=%lu reinit=%lu abort=%lu invalid=%lu zero=%lu age_ms=%lu state=%s stack=%lu",
+              (unsigned long)snapshot.task_loop_counter,
+              (unsigned long)snapshot.frame_counter,
+              (unsigned long)snapshot.fifo_ready_count,
+              (unsigned long)snapshot.fifo_read_count,
+              (unsigned long)snapshot.fifo_recovery_count,
+              (unsigned long)snapshot.reinit_recovery_count,
+              (unsigned long)snapshot.spi_abort_count,
+              (unsigned long)snapshot.invalid_frame_count,
+              (unsigned long)snapshot.zero_frame_count,
+              (unsigned long)snapshot.last_frame_age_ms,
+              radar_state_name(snapshot.state),
+              (unsigned long)snapshot.task_stack_high_water_words);
+#endif
 }
 
 void radar_stop(void)
@@ -777,8 +1142,8 @@ void radar_stop(void)
     {
         (void)xensiv_bgt60trxx_start_frame(&radar_device.dev, false);
         latest_result.running = false;
-        latest_result.presence_detected = false;
-        latest_result.distance_valid = false;
+        set_radar_state(RADAR_STATE_STOPPED);
+        publish_presence_distance(false, false, 0.0f);
         RADAR_LOG("stopped");
     }
 }

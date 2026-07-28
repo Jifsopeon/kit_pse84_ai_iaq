@@ -50,8 +50,44 @@
 #define APP_BLE_MANUAL_LABEL_OFFSET         (22U)
 #define APP_BLE_MANUAL_LABEL_NO_SMOKING     (0U)
 #define APP_BLE_MANUAL_LABEL_SMOKING        (1U)
-#define SEN66_VOC_INDEX_OFFSET_REQUESTED    (250)
-#define SEN66_VOC_GAIN_FACTOR_REQUESTED     (1000)
+#define APP_SEN66_TUNING_VERIFY_FAILED      (-1)
+#define APP_SEN66_VOC_INDEX_OFFSET          (1)
+#define APP_SEN66_VOC_LEARNING_TIME_OFFSET_H (720)
+#define APP_SEN66_VOC_LEARNING_TIME_GAIN_H  (12)
+#define APP_SEN66_VOC_GATING_MAX_DURATION_MIN (180)
+#define APP_SEN66_VOC_STD_INITIAL           (50)
+#define APP_SEN66_VOC_GAIN_FACTOR           (1000)
+#define APP_SEN66_NOX_INDEX_OFFSET          (1)
+#define APP_SEN66_NOX_LEARNING_TIME_OFFSET_H (720)
+#define APP_SEN66_NOX_LEARNING_TIME_GAIN_H  (12)
+#define APP_SEN66_NOX_GATING_MAX_DURATION_MIN (720)
+#define APP_SEN66_NOX_STD_INITIAL           (50)
+#define APP_SEN66_NOX_GAIN_FACTOR           (1000)
+
+_Static_assert((APP_SEN66_VOC_INDEX_OFFSET >= 1) && (APP_SEN66_VOC_INDEX_OFFSET <= 250),
+               "VOC index offset is outside the SEN66 supported range");
+_Static_assert((APP_SEN66_VOC_LEARNING_TIME_OFFSET_H >= 1) && (APP_SEN66_VOC_LEARNING_TIME_OFFSET_H <= 1000),
+               "VOC learning time offset is outside the SEN66 supported range");
+_Static_assert((APP_SEN66_VOC_LEARNING_TIME_GAIN_H >= 1) && (APP_SEN66_VOC_LEARNING_TIME_GAIN_H <= 1000),
+               "VOC learning time gain is outside the SEN66 supported range");
+_Static_assert((APP_SEN66_VOC_GATING_MAX_DURATION_MIN >= 0) && (APP_SEN66_VOC_GATING_MAX_DURATION_MIN <= 3000),
+               "VOC gating max duration is outside the SEN66 supported range");
+_Static_assert((APP_SEN66_VOC_STD_INITIAL >= 10) && (APP_SEN66_VOC_STD_INITIAL <= 5000),
+               "VOC std initial is outside the SEN66 supported range");
+_Static_assert((APP_SEN66_VOC_GAIN_FACTOR >= 1) && (APP_SEN66_VOC_GAIN_FACTOR <= 1000),
+               "VOC gain factor is outside the SEN66 supported range");
+_Static_assert((APP_SEN66_NOX_INDEX_OFFSET >= 1) && (APP_SEN66_NOX_INDEX_OFFSET <= 250),
+               "NOx index offset is outside the SEN66 supported range");
+_Static_assert((APP_SEN66_NOX_LEARNING_TIME_OFFSET_H >= 1) && (APP_SEN66_NOX_LEARNING_TIME_OFFSET_H <= 1000),
+               "NOx learning time offset is outside the SEN66 supported range");
+_Static_assert(APP_SEN66_NOX_LEARNING_TIME_GAIN_H == 12,
+               "NOx learning time gain must be set to 12 hours");
+_Static_assert((APP_SEN66_NOX_GATING_MAX_DURATION_MIN >= 0) && (APP_SEN66_NOX_GATING_MAX_DURATION_MIN <= 3000),
+               "NOx gating max duration is outside the SEN66 supported range");
+_Static_assert(APP_SEN66_NOX_STD_INITIAL == 50,
+               "NOx std initial must be set to 50");
+_Static_assert((APP_SEN66_NOX_GAIN_FACTOR >= 1) && (APP_SEN66_NOX_GAIN_FACTOR <= 1000),
+               "NOx gain factor is outside the SEN66 supported range");
 
 #if (APP_BLE_DISTANCE_OFFSET + 2U) != APP_BLE_MANUAL_LABEL_OFFSET
 #error "BLE radar distance field must end immediately before the manual label byte"
@@ -287,33 +323,66 @@ static void format_i16_scaled_2(int16_t value, int16_t scale, char* buffer, size
     }
 }
 
-static int16_t sen66_apply_voc_tuning(void)
+static bool sen66_tuning_matches(int16_t actual_index_offset,
+                                 int16_t actual_learning_time_offset_hours,
+                                 int16_t actual_learning_time_gain_hours,
+                                 int16_t actual_gating_max_duration_minutes,
+                                 int16_t actual_std_initial,
+                                 int16_t actual_gain_factor,
+                                 int16_t expected_index_offset,
+                                 int16_t expected_learning_time_offset_hours,
+                                 int16_t expected_learning_time_gain_hours,
+                                 int16_t expected_gating_max_duration_minutes,
+                                 int16_t expected_std_initial,
+                                 int16_t expected_gain_factor)
 {
-    int16_t index_offset = 100;
-    int16_t learning_time_offset_hours = 12;
-    int16_t learning_time_gain_hours = 12;
-    int16_t gating_max_duration_minutes = 180;
-    int16_t std_initial = 50;
-    int16_t gain_factor = 230;
-    int16_t readback_index_offset = 0;
-    int16_t readback_learning_time_offset_hours = 0;
-    int16_t readback_learning_time_gain_hours = 0;
-    int16_t readback_gating_max_duration_minutes = 0;
-    int16_t readback_std_initial = 0;
-    int16_t readback_gain_factor = 0;
+    return (actual_index_offset == expected_index_offset) &&
+           (actual_learning_time_offset_hours == expected_learning_time_offset_hours) &&
+           (actual_learning_time_gain_hours == expected_learning_time_gain_hours) &&
+           (actual_gating_max_duration_minutes == expected_gating_max_duration_minutes) &&
+           (actual_std_initial == expected_std_initial) &&
+           (actual_gain_factor == expected_gain_factor);
+}
+
+static int16_t app_sen66_apply_algorithm_tuning(void)
+{
+    int16_t index_offset;
+    int16_t learning_time_offset_hours;
+    int16_t learning_time_gain_hours;
+    int16_t gating_max_duration_minutes;
+    int16_t std_initial;
+    int16_t gain_factor;
     int16_t error;
 
-    printf("[SEN66] Applying VOC algorithm tuning\r\n");
-    printf("[SEN66] VOC index offset requested=%d\r\n", SEN66_VOC_INDEX_OFFSET_REQUESTED);
-    printf("[SEN66] VOC gain factor requested=%d\r\n", SEN66_VOC_GAIN_FACTOR_REQUESTED);
+    printf("[SEN66] applying algorithm tuning\r\n");
 
     error = sen66_stop_measurement();
     if (NO_ERROR != error)
     {
-        printf("[SEN66] VOC tuning idle request failed status=%d\r\n", error);
+        printf("[SEN66] tuning idle request failed status=%d\r\n", error);
         return error;
     }
-    printf("[SEN66] VOC tuning sensor idle confirmed via stop_measurement\r\n");
+    printf("[SEN66] tuning sensor idle confirmed via stop_measurement\r\n");
+
+    printf("[SEN66] applying VOC tuning index_offset=%d learning_offset_h=%d learning_gain_h=%d gating_min=%d std_initial=%d gain=%d\r\n",
+           APP_SEN66_VOC_INDEX_OFFSET,
+           APP_SEN66_VOC_LEARNING_TIME_OFFSET_H,
+           APP_SEN66_VOC_LEARNING_TIME_GAIN_H,
+           APP_SEN66_VOC_GATING_MAX_DURATION_MIN,
+           APP_SEN66_VOC_STD_INITIAL,
+           APP_SEN66_VOC_GAIN_FACTOR);
+
+    error = sen66_set_voc_algorithm_tuning_parameters(APP_SEN66_VOC_INDEX_OFFSET,
+                                                      APP_SEN66_VOC_LEARNING_TIME_OFFSET_H,
+                                                      APP_SEN66_VOC_LEARNING_TIME_GAIN_H,
+                                                      APP_SEN66_VOC_GATING_MAX_DURATION_MIN,
+                                                      APP_SEN66_VOC_STD_INITIAL,
+                                                      APP_SEN66_VOC_GAIN_FACTOR);
+    if (NO_ERROR != error)
+    {
+        printf("[SEN66] VOC tuning failed status=%d\r\n", error);
+        return error;
+    }
 
     error = sen66_get_voc_algorithm_tuning_parameters(&index_offset,
                                                       &learning_time_offset_hours,
@@ -323,61 +392,96 @@ static int16_t sen66_apply_voc_tuning(void)
                                                       &gain_factor);
     if (NO_ERROR != error)
     {
-        printf("[SEN66] VOC tuning read current failed status=%d\r\n", error);
+        printf("[SEN66] VOC tuning readback failed status=%d\r\n", error);
         return error;
     }
 
-    printf("[SEN66] VOC tuning current: index_offset=%d learning_time_offset=%d learning_time_gain=%d gating_max_duration=%d std_initial=%d gain_factor=%d\r\n",
+    printf("[SEN66] VOC tuning readback index_offset=%d learning_offset_h=%d learning_gain_h=%d gating_min=%d std_initial=%d gain=%d\r\n",
            index_offset,
            learning_time_offset_hours,
            learning_time_gain_hours,
            gating_max_duration_minutes,
            std_initial,
            gain_factor);
-    printf("[SEN66] VOC tuning preserved: learning_time_offset=%d learning_time_gain=%d gating_max_duration=%d std_initial=%d\r\n",
+
+    if (!sen66_tuning_matches(index_offset,
+                              learning_time_offset_hours,
+                              learning_time_gain_hours,
+                              gating_max_duration_minutes,
+                              std_initial,
+                              gain_factor,
+                              APP_SEN66_VOC_INDEX_OFFSET,
+                              APP_SEN66_VOC_LEARNING_TIME_OFFSET_H,
+                              APP_SEN66_VOC_LEARNING_TIME_GAIN_H,
+                              APP_SEN66_VOC_GATING_MAX_DURATION_MIN,
+                              APP_SEN66_VOC_STD_INITIAL,
+                              APP_SEN66_VOC_GAIN_FACTOR))
+    {
+        printf("[SEN66] VOC tuning verify failed\r\n");
+        return APP_SEN66_TUNING_VERIFY_FAILED;
+    }
+
+    printf("[SEN66] VOC tuning applied\r\n");
+
+    printf("[SEN66] applying NOx tuning index_offset=%d learning_offset_h=%d learning_gain_h=%d gating_min=%d std_initial=%d gain=%d\r\n",
+           APP_SEN66_NOX_INDEX_OFFSET,
+           APP_SEN66_NOX_LEARNING_TIME_OFFSET_H,
+           APP_SEN66_NOX_LEARNING_TIME_GAIN_H,
+           APP_SEN66_NOX_GATING_MAX_DURATION_MIN,
+           APP_SEN66_NOX_STD_INITIAL,
+           APP_SEN66_NOX_GAIN_FACTOR);
+
+    error = sen66_set_nox_algorithm_tuning_parameters(APP_SEN66_NOX_INDEX_OFFSET,
+                                                      APP_SEN66_NOX_LEARNING_TIME_OFFSET_H,
+                                                      APP_SEN66_NOX_LEARNING_TIME_GAIN_H,
+                                                      APP_SEN66_NOX_GATING_MAX_DURATION_MIN,
+                                                      APP_SEN66_NOX_STD_INITIAL,
+                                                      APP_SEN66_NOX_GAIN_FACTOR);
+    if (NO_ERROR != error)
+    {
+        printf("[SEN66] NOx tuning failed status=%d\r\n", error);
+        return error;
+    }
+
+    error = sen66_get_nox_algorithm_tuning_parameters(&index_offset,
+                                                      &learning_time_offset_hours,
+                                                      &learning_time_gain_hours,
+                                                      &gating_max_duration_minutes,
+                                                      &std_initial,
+                                                      &gain_factor);
+    if (NO_ERROR != error)
+    {
+        printf("[SEN66] NOx tuning readback failed status=%d\r\n", error);
+        return error;
+    }
+
+    printf("[SEN66] NOx tuning readback index_offset=%d learning_offset_h=%d learning_gain_h=%d gating_min=%d std_initial=%d gain=%d\r\n",
+           index_offset,
            learning_time_offset_hours,
            learning_time_gain_hours,
            gating_max_duration_minutes,
-           std_initial);
+           std_initial,
+           gain_factor);
 
-    error = sen66_set_voc_algorithm_tuning_parameters(SEN66_VOC_INDEX_OFFSET_REQUESTED,
-                                                      learning_time_offset_hours,
-                                                      learning_time_gain_hours,
-                                                      gating_max_duration_minutes,
-                                                      std_initial,
-                                                      SEN66_VOC_GAIN_FACTOR_REQUESTED);
-    printf("[SEN66] VOC tuning write result=%d\r\n", error);
-    if (NO_ERROR != error)
+    if (!sen66_tuning_matches(index_offset,
+                              learning_time_offset_hours,
+                              learning_time_gain_hours,
+                              gating_max_duration_minutes,
+                              std_initial,
+                              gain_factor,
+                              APP_SEN66_NOX_INDEX_OFFSET,
+                              APP_SEN66_NOX_LEARNING_TIME_OFFSET_H,
+                              APP_SEN66_NOX_LEARNING_TIME_GAIN_H,
+                              APP_SEN66_NOX_GATING_MAX_DURATION_MIN,
+                              APP_SEN66_NOX_STD_INITIAL,
+                              APP_SEN66_NOX_GAIN_FACTOR))
     {
-        return error;
+        printf("[SEN66] NOx tuning verify failed\r\n");
+        return APP_SEN66_TUNING_VERIFY_FAILED;
     }
 
-    error = sen66_get_voc_algorithm_tuning_parameters(&readback_index_offset,
-                                                      &readback_learning_time_offset_hours,
-                                                      &readback_learning_time_gain_hours,
-                                                      &readback_gating_max_duration_minutes,
-                                                      &readback_std_initial,
-                                                      &readback_gain_factor);
-    if (NO_ERROR != error)
-    {
-        printf("[SEN66] VOC tuning readback failed status=%d\r\n", error);
-        return error;
-    }
-
-    printf("[SEN66] VOC tuning readback: index_offset=%d gain_factor=%d\r\n",
-           readback_index_offset,
-           readback_gain_factor);
-
-    if ((SEN66_VOC_INDEX_OFFSET_REQUESTED != readback_index_offset) ||
-        (SEN66_VOC_GAIN_FACTOR_REQUESTED != readback_gain_factor))
-    {
-        printf("[SEN66] VOC tuning verify failed index_offset=%d gain_factor=%d\r\n",
-               readback_index_offset,
-               readback_gain_factor);
-        return -1;
-    }
-
-    printf("[SEN66] VOC tuning configuration complete\r\n");
+    printf("[SEN66] NOx tuning applied\r\n");
+    printf("[SEN66] algorithm tuning configuration complete\r\n");
     return NO_ERROR;
 }
 
@@ -493,6 +597,7 @@ static void wait_sample_period_and_update_label(bool* manual_smoking, bool* sw1_
         vTaskDelay(pdMS_TO_TICKS(SW1_POLL_PERIOD_MS));
         update_manual_label(manual_smoking, sw1_was_pressed, sw1_stable_pressed_count);
         app_ble_iaq_process();
+        radar_log_watchdog();
         if (drain_ble_commands(manual_smoking, sample_period_ms))
         {
             break;
@@ -537,10 +642,10 @@ static void task_sen66_stream(void* arg)
         printf("sen66_serial_error:%d\r\n", error);
     }
 
-    error = sen66_apply_voc_tuning();
+    error = app_sen66_apply_algorithm_tuning();
     if (NO_ERROR != error)
     {
-        printf("[SEN66] VOC tuning failed status=%d; continuing with sensor defaults\r\n", error);
+        printf("[SEN66] algorithm tuning failed status=%d; continuing without verified tuning\r\n", error);
     }
 
     error = sen66_start_continuous_measurement();
@@ -587,11 +692,11 @@ static void task_sen66_stream(void* arg)
             continue;
         }
 
-        const radar_result_t *radar_result = radar_get_latest_result();
-        float radar_distance_m = ((NULL != radar_result) &&
-                                  radar_result->presence_detected &&
-                                  radar_result->distance_valid) ?
-                                 radar_result->distance_m : 0.0f;
+        radar_result_t radar_result;
+        radar_get_latest_result(&radar_result);
+        float radar_distance_m = (radar_result.presence_detected &&
+                                  radar_result.distance_valid) ?
+                                 radar_result.distance_m : 0.0f;
 
         manual_smoking = app_manual_smoking;
         format_u16_scaled_1(pm1p0, pm1p0_text, sizeof(pm1p0_text));
@@ -648,7 +753,16 @@ static void task_radar(void* arg)
 
     for (;;)
     {
-        (void)radar_process();
+        cy_rslt_t process_result = radar_process();
+        if (CY_RSLT_SUCCESS != process_result)
+        {
+            printf("[RADAR] process error result=0x%08lx; attempting recovery\r\n",
+                   (unsigned long)process_result);
+            if (CY_RSLT_SUCCESS != radar_start())
+            {
+                vTaskDelay(pdMS_TO_TICKS(1000U));
+            }
+        }
         vTaskDelay(pdMS_TO_TICKS(RADAR_TASK_PERIOD_MS));
     }
 }
