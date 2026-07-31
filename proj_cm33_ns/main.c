@@ -18,6 +18,7 @@
 #include "sensirion_i2c_hal.h"
 #include "app_ble_iaq.h"
 #include "app_radar.h"
+#include "sen66_prediction.h"
 
 #include <math.h>
 #include <stdbool.h>
@@ -46,8 +47,10 @@
 #define MANUAL_LABEL_SMOKING                "smoking"
 #define APP_DISTANCE_MAX_CM                 (500U)
 #define APP_SERIAL_LINE_SIZE                (384U)
-#define APP_BLE_DISTANCE_OFFSET             (20U)
+#define APP_BLE_ENVIRONMENTAL_DATA_LEN      (20U)
+#define APP_BLE_DISTANCE_OFFSET             (APP_BLE_ENVIRONMENTAL_DATA_LEN)
 #define APP_BLE_MANUAL_LABEL_OFFSET         (22U)
+#define APP_BLE_PREDICTED_OFFSET            (23U)
 #define APP_BLE_MANUAL_LABEL_NO_SMOKING     (0U)
 #define APP_BLE_MANUAL_LABEL_SMOKING        (1U)
 #define APP_SEN66_TUNING_VERIFY_FAILED      (-1)
@@ -93,8 +96,12 @@ _Static_assert((APP_SEN66_NOX_GAIN_FACTOR >= 1) && (APP_SEN66_NOX_GAIN_FACTOR <=
 #error "BLE radar distance field must end immediately before the manual label byte"
 #endif
 
-#if (APP_BLE_MANUAL_LABEL_OFFSET + 1U) != APP_BLE_IAQ_PACKET_LEN
-#error "BLE manual label byte must be the final IAQ packet field"
+#if (APP_BLE_MANUAL_LABEL_OFFSET + 1U) != APP_BLE_PREDICTED_OFFSET
+#error "BLE predicted byte must immediately follow the manual label byte"
+#endif
+
+#if (APP_BLE_PREDICTED_OFFSET + 1U) != APP_BLE_IAQ_PACKET_LEN
+#error "BLE predicted byte must be the final IAQ packet field"
 #endif
 
 #if defined(CYBSP_CM33_LPTIMER_0)
@@ -620,6 +627,7 @@ static void task_sen66_stream(void* arg)
 
     set_manual_label(manual_smoking);
     set_distance_cm(0U);
+    sen66_prediction_init();
 
     sensirion_i2c_hal_init();
     sen66_init(SEN66_I2C_ADDR_6B);
@@ -680,6 +688,7 @@ static void task_sen66_stream(void* arg)
         char distance_text[16] = {0};
         char serial_line[APP_SERIAL_LINE_SIZE] = {0};
         uint8_t ble_packet[APP_BLE_IAQ_PACKET_LEN] = {0};
+        uint8_t predicted = SEN66_PREDICTION_NOT_READY;
 
         wait_sample_period_and_update_label(&manual_smoking, &sw1_was_pressed,
                                             &sw1_stable_pressed_count, &sample_period_ms);
@@ -708,12 +717,15 @@ static void task_sen66_stream(void* arg)
         format_i16_scaled_1(voc, voc_text, sizeof(voc_text));
         format_i16_scaled_1(nox, nox_text, sizeof(nox_text));
         format_distance_slot_m(radar_distance_m, distance_text, sizeof(distance_text));
+        (void)sen66_prediction_update(pm1p0, pm2p5, pm4p0, pm10p0,
+                                      voc, nox, co2, &predicted);
 
         snprintf(serial_line, sizeof(serial_line),
-                 "PM1.0: %s  PM2.5: %s  PM4.0: %s  PM10.0: %s  Humidity: %s  Temperature: %s  VOC: %s  NOx: %s  CO2: %u  Distance: %s  Manual Label: %s\r\n",
+                 "PM1.0: %s  PM2.5: %s  PM4.0: %s  PM10.0: %s  Humidity: %s  Temperature: %s  VOC: %s  NOx: %s  CO2: %u  Distance: %s  Manual Label: %s, Predicted: %s\r\n",
                  pm1p0_text, pm2p5_text, pm4p0_text, pm10p0_text,
                  humidity_text, temperature_text, voc_text, nox_text, co2, distance_text,
-                 manual_smoking ? MANUAL_LABEL_SMOKING : MANUAL_LABEL_NO_SMOKING);
+                 manual_smoking ? MANUAL_LABEL_SMOKING : MANUAL_LABEL_NO_SMOKING,
+                 sen66_prediction_format(predicted));
         printf("%s", serial_line);
 
         put_u16_le(ble_packet, 0U, sequence++);
@@ -730,6 +742,7 @@ static void task_sen66_stream(void* arg)
         ble_packet[APP_BLE_MANUAL_LABEL_OFFSET] = manual_smoking ?
                                                   APP_BLE_MANUAL_LABEL_SMOKING :
                                                   APP_BLE_MANUAL_LABEL_NO_SMOKING;
+        ble_packet[APP_BLE_PREDICTED_OFFSET] = predicted;
         app_ble_iaq_notify_sensor_packet(ble_packet);
     }
 }

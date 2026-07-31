@@ -68,7 +68,7 @@ SOURCES+=
 
 # Like SOURCES, but for include directories. Value should be paths to
 # directories (without a leading -I).
-INCLUDES+=GeneratedSource source source/sen66
+INCLUDES+=GeneratedSource source source/sen66 source/model source/prediction
 
 # Add additional defines to the build process (without a leading -D).
 DEFINES+=CY_RETARGET_IO_CONVERT_LF_TO_CRLF CY_RTOS_AWARE CYBSP_BT_PLATFORM_CFG_BAUD_FEATURE=3000000

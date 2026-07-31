@@ -15,6 +15,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define RADAR_SPI_INTR_PRIORITY              (2U)
 #define RADAR_SPI_SLAVE_SELECT              (CY_SCB_SPI_SLAVE_SELECT1)
@@ -44,14 +45,32 @@ typedef struct
     float strength;
     float noise_floor;
     float snr;
+    float short_motion_score;
+    float micro_motion_score;
+    float persistence_score;
+    float track_score;
+    float presence_bin_score;
+    float static_penalty;
+    float candidate_score;
+    float required_score;
+    float motion_noise;
     uint8_t confirmation_count;
+    uint8_t motion_persistence;
+    uint8_t static_observation_count;
+    bool live_motion;
+    const char *state_name;
+    const char *reject_reason;
 } radar_target_t;
 
 typedef struct
 {
     bool valid;
     uint8_t missed_frames;
+    uint8_t switch_frames;
+    uint16_t peak_bin;
+    uint16_t switch_bin;
     float filtered_distance_m;
+    float confidence;
 } radar_selected_target_state_t;
 
 typedef struct
@@ -73,6 +92,13 @@ static float32_t fft_output[APP_RADAR_RANGE_FFT_SIZE];
 static float32_t range_window[APP_RADAR_RANGE_FFT_SIZE];
 static float32_t range_power[APP_RADAR_RANGE_BIN_COUNT];
 static float32_t clutter_power[APP_RADAR_RANGE_BIN_COUNT];
+static float32_t previous_range_power[APP_RADAR_RANGE_BIN_COUNT];
+static float32_t short_motion_power[APP_RADAR_RANGE_BIN_COUNT];
+static float32_t micro_motion_power[APP_RADAR_RANGE_BIN_COUNT];
+static float32_t motion_noise_power[APP_RADAR_RANGE_BIN_COUNT];
+static uint8_t motion_persistence_bins[APP_RADAR_RANGE_BIN_COUNT];
+static uint8_t static_observation_bins[APP_RADAR_RANGE_BIN_COUNT];
+static uint8_t provisional_protect_bins[APP_RADAR_RANGE_BIN_COUNT];
 static bool detection_bins[APP_RADAR_RANGE_BIN_COUNT];
 static radar_target_t previous_targets[RADAR_INTERNAL_MAX_CANDIDATES];
 static radar_selected_target_state_t selected_state;
@@ -84,6 +110,9 @@ static uint16_t leakage_reject_bin;
 static uint32_t absence_frames;
 static uint32_t stale_frame_polls;
 static uint32_t consecutive_invalid_frames;
+static int32_t active_presence_bin = -1;
+static uint16_t diagnostic_selected_bin;
+static const char *diagnostic_selection_reason = "no_live_candidate";
 static uint8_t previous_target_count;
 static bool motion_presence_detected;
 static bool last_presence_state;
@@ -154,6 +183,86 @@ static uint16_t clamp_bin(int32_t bin)
     return (uint16_t)bin;
 }
 
+static float clamp_float(float value, float minimum, float maximum)
+{
+    if (value < minimum)
+    {
+        return minimum;
+    }
+    if (value > maximum)
+    {
+        return maximum;
+    }
+    return value;
+}
+
+static float bounded_ratio(float numerator, float denominator, float maximum)
+{
+    float safe_denominator = (denominator > 1.0f) ? denominator : 1.0f;
+    return clamp_float(numerator / safe_denominator, 0.0f, maximum);
+}
+
+static bool bin_is_near(uint16_t left, uint16_t right, uint16_t tolerance)
+{
+    return (left > right) ? ((left - right) <= tolerance) : ((right - left) <= tolerance);
+}
+
+static bool bin_is_protected(uint16_t bin)
+{
+    if (provisional_protect_bins[bin] > 0U)
+    {
+        return true;
+    }
+
+    if (!selected_state.valid)
+    {
+        return false;
+    }
+
+    return bin_is_near(bin, selected_state.peak_bin, APP_RADAR_PROTECTED_BIN_WIDTH);
+}
+
+static void protect_candidate_bin(uint16_t center_bin)
+{
+    uint16_t first_bin = (center_bin > APP_RADAR_PROTECTED_BIN_WIDTH) ?
+                         (uint16_t)(center_bin - APP_RADAR_PROTECTED_BIN_WIDTH) : 0U;
+    uint16_t last_bin = (uint16_t)(center_bin + APP_RADAR_PROTECTED_BIN_WIDTH);
+    if (last_bin >= APP_RADAR_RANGE_BIN_COUNT)
+    {
+        last_bin = (uint16_t)(APP_RADAR_RANGE_BIN_COUNT - 1U);
+    }
+
+    for (uint16_t bin = first_bin; bin <= last_bin; bin++)
+    {
+        provisional_protect_bins[bin] = APP_RADAR_PROVISIONAL_PROTECT_FRAMES;
+    }
+}
+
+static void age_provisional_protection(void)
+{
+    for (uint16_t bin = 0U; bin < APP_RADAR_RANGE_BIN_COUNT; bin++)
+    {
+        if (provisional_protect_bins[bin] > 0U)
+        {
+            provisional_protect_bins[bin]--;
+        }
+    }
+}
+
+static void initialize_motion_history(void)
+{
+    for (uint32_t bin = 0U; bin < APP_RADAR_RANGE_BIN_COUNT; bin++)
+    {
+        previous_range_power[bin] = 0.0f;
+        short_motion_power[bin] = 0.0f;
+        micro_motion_power[bin] = 0.0f;
+        motion_noise_power[bin] = APP_RADAR_MOTION_NOISE_MIN;
+        motion_persistence_bins[bin] = 0U;
+        static_observation_bins[bin] = 0U;
+        provisional_protect_bins[bin] = 0U;
+    }
+}
+
 static void init_range_window(void)
 {
     for (uint32_t i = 0U; i < APP_RADAR_RANGE_FFT_SIZE; i++)
@@ -181,9 +290,6 @@ static float fft_bin_power(uint16_t bin)
 
 static void build_range_profile(void)
 {
-    bool update_clutter = (latest_result.frame_counter < APP_RADAR_CLUTTER_SETTLE_FRAMES) ||
-                          !motion_presence_detected;
-
     for (uint32_t bin = 0U; bin < APP_RADAR_RANGE_BIN_COUNT; bin++)
     {
         range_power[bin] = 0.0f;
@@ -217,18 +323,82 @@ static void build_range_profile(void)
     for (uint32_t bin = 0U; bin < APP_RADAR_RANGE_BIN_COUNT; bin++)
     {
         range_power[bin] /= (float)APP_RADAR_CHIRPS_PER_FRAME;
+        float raw_power = range_power[bin];
 
         if (0U == latest_result.frame_counter)
         {
-            clutter_power[bin] = range_power[bin];
+            clutter_power[bin] = raw_power;
         }
-        else if (update_clutter)
+        else
         {
-            clutter_power[bin] += APP_RADAR_CLUTTER_ALPHA * (range_power[bin] - clutter_power[bin]);
+            float residual = (raw_power > clutter_power[bin]) ? (raw_power - clutter_power[bin]) : 0.0f;
+            bool protected_bin = bin_is_protected((uint16_t)bin);
+            bool settling = latest_result.frame_counter < APP_RADAR_CLUTTER_SETTLE_FRAMES;
+            bool stable_bin = residual < (motion_noise_power[bin] * APP_RADAR_TRACKED_TARGET_MOTION_RATIO);
+            float clutter_alpha = APP_RADAR_CLUTTER_TRANSIENT_ALPHA;
+
+            if (protected_bin)
+            {
+                clutter_alpha = APP_RADAR_CLUTTER_TRACKED_ALPHA;
+            }
+            else if (settling || stable_bin || !motion_presence_detected)
+            {
+                clutter_alpha = APP_RADAR_CLUTTER_STABLE_ALPHA;
+            }
+
+            clutter_power[bin] += clutter_alpha * (raw_power - clutter_power[bin]);
         }
 
-        range_power[bin] = (range_power[bin] > clutter_power[bin]) ?
-                           (range_power[bin] - clutter_power[bin]) : 0.0f;
+        range_power[bin] = (raw_power > clutter_power[bin]) ? (raw_power - clutter_power[bin]) : 0.0f;
+    }
+}
+
+static void update_temporal_motion_features(void)
+{
+    for (uint16_t bin = min_range_bin; bin <= max_range_bin; bin++)
+    {
+        float diff = fabsf(range_power[bin] - previous_range_power[bin]);
+        short_motion_power[bin] += APP_RADAR_MOTION_SHORT_ALPHA *
+                                   (diff - short_motion_power[bin]);
+        micro_motion_power[bin] += APP_RADAR_MOTION_MICRO_ALPHA *
+                                   (diff - micro_motion_power[bin]);
+
+        bool protected_bin = bin_is_protected(bin);
+        float short_ratio = bounded_ratio(short_motion_power[bin],
+                                          motion_noise_power[bin],
+                                          20.0f);
+        float micro_ratio = bounded_ratio(micro_motion_power[bin],
+                                          motion_noise_power[bin],
+                                          20.0f);
+        bool active_motion = (short_ratio >= APP_RADAR_TRACKED_TARGET_MOTION_RATIO) ||
+                             (micro_ratio >= APP_RADAR_TRACKED_TARGET_MICRO_RATIO);
+
+        float noise_alpha = APP_RADAR_MOTION_NOISE_ALPHA;
+        if (protected_bin && active_motion && (diff > motion_noise_power[bin]))
+        {
+            noise_alpha = APP_RADAR_MOTION_NOISE_PROTECT_ALPHA;
+        }
+        motion_noise_power[bin] += noise_alpha * (diff - motion_noise_power[bin]);
+        motion_noise_power[bin] = clamp_float(motion_noise_power[bin],
+                                              APP_RADAR_MOTION_NOISE_MIN,
+                                              APP_RADAR_MOTION_NOISE_MAX);
+
+        short_ratio = bounded_ratio(short_motion_power[bin], motion_noise_power[bin], 20.0f);
+        micro_ratio = bounded_ratio(micro_motion_power[bin], motion_noise_power[bin], 20.0f);
+        if ((short_ratio >= APP_RADAR_TRACKED_TARGET_MOTION_RATIO) ||
+            (micro_ratio >= APP_RADAR_TRACKED_TARGET_MICRO_RATIO))
+        {
+            if (motion_persistence_bins[bin] < APP_RADAR_MAX_PERSISTENCE_SCORE)
+            {
+                motion_persistence_bins[bin]++;
+            }
+        }
+        else if (motion_persistence_bins[bin] > 0U)
+        {
+            motion_persistence_bins[bin]--;
+        }
+
+        previous_range_power[bin] = range_power[bin];
     }
 }
 
@@ -289,6 +459,95 @@ static float interpolate_peak_bin(uint16_t peak_bin)
     }
 
     return (float)peak_bin + offset;
+}
+
+static void score_candidate(radar_target_t *target)
+{
+    bool tracked_candidate = selected_state.valid &&
+                             bin_is_near(target->peak_bin,
+                                         selected_state.peak_bin,
+                                         APP_RADAR_TRACK_BIN_TOLERANCE);
+
+    target->short_motion_score = bounded_ratio(short_motion_power[target->peak_bin],
+                                               motion_noise_power[target->peak_bin],
+                                               20.0f);
+    target->micro_motion_score = bounded_ratio(micro_motion_power[target->peak_bin],
+                                               motion_noise_power[target->peak_bin],
+                                               20.0f);
+    target->motion_noise = motion_noise_power[target->peak_bin];
+    target->motion_persistence = motion_persistence_bins[target->peak_bin];
+    target->persistence_score = (float)target->motion_persistence;
+    target->track_score = tracked_candidate ? 1.0f : 0.0f;
+    target->presence_bin_score = 0.0f;
+    if (active_presence_bin >= 0)
+    {
+        uint16_t presence_bin = (uint16_t)active_presence_bin;
+        if (target->peak_bin == presence_bin)
+        {
+            target->presence_bin_score = APP_RADAR_SCORE_PRESENCE_EXACT;
+        }
+        else if (bin_is_near(target->peak_bin, presence_bin, APP_RADAR_PRESENCE_STRONG_BIN_TOLERANCE))
+        {
+            target->presence_bin_score = APP_RADAR_SCORE_PRESENCE_NEAR;
+        }
+        else if (bin_is_near(target->peak_bin, presence_bin, APP_RADAR_PRESENCE_BIN_TOLERANCE))
+        {
+            target->presence_bin_score = APP_RADAR_SCORE_PRESENCE_FAR;
+        }
+    }
+
+    bool new_motion = (target->short_motion_score >= APP_RADAR_NEW_TARGET_MOTION_RATIO) ||
+                      (target->presence_bin_score >= APP_RADAR_SCORE_PRESENCE_NEAR);
+    bool tracked_motion = tracked_candidate &&
+                          ((target->short_motion_score >= APP_RADAR_TRACKED_TARGET_MOTION_RATIO) ||
+                           (target->micro_motion_score >= APP_RADAR_TRACKED_TARGET_MICRO_RATIO) ||
+                           (target->presence_bin_score > 0.0f));
+    target->live_motion = new_motion || tracked_motion;
+
+    bool strong_static = (target->strength >= (APP_RADAR_MIN_PEAK_POWER * APP_RADAR_STATIC_POWER_RATIO)) &&
+                         (target->short_motion_score < APP_RADAR_TRACKED_TARGET_MOTION_RATIO) &&
+                         (target->micro_motion_score < APP_RADAR_TRACKED_TARGET_MICRO_RATIO);
+    bool protected_from_static = tracked_candidate ||
+                                 (target->presence_bin_score > 0.0f) ||
+                                 (target->motion_persistence < APP_RADAR_STATIC_GRACE_FRAMES);
+
+    if ((target->short_motion_score >= APP_RADAR_STATIC_CLEAR_MOTION_RATIO) ||
+        (target->micro_motion_score >= APP_RADAR_STATIC_CLEAR_MOTION_RATIO) ||
+        protected_from_static)
+    {
+        static_observation_bins[target->peak_bin] = 0U;
+    }
+    else if (strong_static && (static_observation_bins[target->peak_bin] < UINT8_MAX))
+    {
+        static_observation_bins[target->peak_bin]++;
+    }
+
+    target->static_observation_count = static_observation_bins[target->peak_bin];
+    target->static_penalty = (strong_static &&
+                              (target->static_observation_count >= APP_RADAR_STATIC_OBSERVATION_FRAMES)) ?
+                             APP_RADAR_STATIC_PENALTY : 0.0f;
+
+    float snr_score = clamp_float(target->snr, 0.0f, 20.0f) * APP_RADAR_SCORE_SNR_WEIGHT;
+    float power_score = (target->strength /
+                         (target->strength + (APP_RADAR_MIN_PEAK_POWER * APP_RADAR_STATIC_POWER_RATIO))) *
+                        APP_RADAR_SCORE_POWER_WEIGHT;
+    float near_tie_score = (APP_RADAR_MAX_DISTANCE_M - target->distance_m) *
+                           APP_RADAR_SCORE_NEAR_TIE_WEIGHT;
+
+    target->candidate_score =
+        (target->short_motion_score * APP_RADAR_SCORE_MOTION_WEIGHT) +
+        (target->micro_motion_score * APP_RADAR_SCORE_MICRO_WEIGHT) +
+        (target->persistence_score * APP_RADAR_SCORE_PERSISTENCE_WEIGHT) +
+        (target->track_score * APP_RADAR_SCORE_TRACK_WEIGHT) +
+        target->presence_bin_score +
+        snr_score +
+        power_score +
+        near_tie_score -
+        target->static_penalty;
+    target->required_score = tracked_candidate ? APP_RADAR_SCORE_MIN_TRACKED :
+                             APP_RADAR_SCORE_MIN_NEW;
+    target->state_name = tracked_candidate ? "TRACK" : "ACQUIRE";
+    target->reject_reason = "LOW_SCORE";
 }
 
 static uint8_t find_candidate_targets(radar_target_t *targets, uint8_t max_targets)
@@ -388,6 +647,13 @@ static uint8_t find_candidate_targets(radar_target_t *targets, uint8_t max_targe
         targets[target_count].noise_floor = noise;
         targets[target_count].snr = peak_power / noise;
         targets[target_count].confirmation_count = 1U;
+        score_candidate(&targets[target_count]);
+        if (targets[target_count].live_motion ||
+            (targets[target_count].short_motion_score >= APP_RADAR_TRACKED_TARGET_MOTION_RATIO) ||
+            (targets[target_count].presence_bin_score > 0.0f))
+        {
+            protect_candidate_bin(peak_bin);
+        }
         target_count++;
     }
 
@@ -457,58 +723,165 @@ static void reset_tracking_state(void)
 {
     selected_state.valid = false;
     selected_state.missed_frames = 0U;
+    selected_state.switch_frames = 0U;
+    selected_state.peak_bin = 0U;
+    selected_state.switch_bin = 0U;
+    selected_state.confidence = 0.0f;
+    active_presence_bin = -1;
+    diagnostic_selected_bin = 0U;
+    diagnostic_selection_reason = "no_live_candidate";
     previous_target_count = 0U;
     absence_frames = 0U;
     motion_presence_detected = false;
+    initialize_motion_history();
     publish_presence_distance(false, false, 0.0f);
 }
 
-static void update_selected_distance(const radar_target_t *targets, uint8_t target_count)
+static radar_target_t *select_best_live_candidate(radar_target_t *targets,
+                                                  uint8_t target_count)
 {
-    if (!motion_presence_detected || (0U == target_count))
+    radar_target_t *best = NULL;
+
+    for (uint8_t i = 0U; i < target_count; i++)
+    {
+        bool tracked_candidate = selected_state.valid &&
+                                 bin_is_near(targets[i].peak_bin,
+                                             selected_state.peak_bin,
+                                             APP_RADAR_TRACK_BIN_TOLERANCE);
+        bool switch_candidate = selected_state.valid && !tracked_candidate;
+        float minimum_score = switch_candidate ? APP_RADAR_SCORE_MIN_SWITCH :
+                              (tracked_candidate ? APP_RADAR_SCORE_MIN_TRACKED :
+                               APP_RADAR_SCORE_MIN_NEW);
+        targets[i].required_score = minimum_score;
+        targets[i].state_name = switch_candidate ? "SWITCH" :
+                                (tracked_candidate ? "TRACK" : "ACQUIRE");
+        targets[i].reject_reason = "SELECTED";
+
+        if (!targets[i].live_motion && !tracked_candidate)
+        {
+            targets[i].reject_reason = "LOW_MOTION";
+            continue;
+        }
+        if (targets[i].candidate_score < minimum_score)
+        {
+            targets[i].reject_reason = (targets[i].static_penalty > 0.0f) ?
+                                       "STATIC_PENALTY" : "LOW_SCORE";
+            continue;
+        }
+        if ((NULL == best) || (targets[i].candidate_score > best->candidate_score))
+        {
+            best = &targets[i];
+        }
+    }
+
+    return best;
+}
+
+static void update_selected_distance(radar_target_t *targets, uint8_t target_count)
+{
+    radar_target_t *selected = NULL;
+
+    if (motion_presence_detected && (target_count > 0U))
+    {
+        selected = select_best_live_candidate(targets, target_count);
+    }
+
+    for (uint8_t i = 0U; i < target_count; i++)
+    {
+        if ((&targets[i] != selected) && (0 == strcmp(targets[i].reject_reason, "SELECTED")))
+        {
+            targets[i].reject_reason = "LOW_SCORE";
+        }
+    }
+
+    if ((NULL == selected) || !motion_presence_detected)
     {
         if (selected_state.valid && (selected_state.missed_frames < APP_RADAR_ALLOWED_MISSED_FRAMES))
         {
             selected_state.missed_frames++;
+            selected_state.confidence *= 0.75f;
+            diagnostic_selected_bin = selected_state.peak_bin;
+            diagnostic_selection_reason = "no_live_candidate";
+            publish_presence_distance(motion_presence_detected, true, selected_state.filtered_distance_m);
         }
         else
         {
             selected_state.valid = false;
+            selected_state.switch_frames = 0U;
+            selected_state.confidence = 0.0f;
+            diagnostic_selected_bin = 0U;
+            diagnostic_selection_reason = "stale_cleared";
             clear_published_distance();
         }
         return;
     }
 
-    const radar_target_t *nearest = &targets[0];
-
-    for (uint8_t i = 1U; i < target_count; i++)
-    {
-        if (targets[i].distance_m < nearest->distance_m)
-        {
-            nearest = &targets[i];
-        }
-    }
-
-    /* Binary presence plus one selected range estimate. If multiple FFT peaks
-     * exist internally, publish only the nearest confirmed valid target.
-     */
-    float selected_distance_m = nearest->distance_m;
+    float selected_distance_m = selected->distance_m;
     bool target_jump = selected_state.valid &&
                        (fabsf(selected_distance_m - selected_state.filtered_distance_m) >
                         APP_RADAR_MAX_JUMP_M);
 
-    if (!selected_state.valid || target_jump)
+    if (selected_state.valid && target_jump &&
+        !bin_is_near(selected->peak_bin, selected_state.peak_bin, APP_RADAR_TRACK_BIN_TOLERANCE))
+    {
+        if (bin_is_near(selected->peak_bin, selected_state.switch_bin, APP_RADAR_TRACK_BIN_TOLERANCE))
+        {
+            if (selected_state.switch_frames < APP_RADAR_SWITCH_CONFIRMATION_FRAMES)
+            {
+                selected_state.switch_frames++;
+            }
+        }
+        else
+        {
+            selected_state.switch_bin = selected->peak_bin;
+            selected_state.switch_frames = 1U;
+        }
+
+        if (selected_state.switch_frames < APP_RADAR_SWITCH_CONFIRMATION_FRAMES)
+        {
+            selected_state.missed_frames = 0U;
+            selected_state.confidence *= 0.9f;
+            diagnostic_selected_bin = selected_state.peak_bin;
+            diagnostic_selection_reason = "tracked_motion";
+            selected->reject_reason = "SWITCH_NOT_CONFIRMED";
+            publish_presence_distance(true, true, selected_state.filtered_distance_m);
+            absence_frames = 0U;
+            return;
+        }
+
+        selected_state.filtered_distance_m = selected_distance_m;
+        selected_state.peak_bin = selected->peak_bin;
+        selected_state.valid = true;
+        selected_state.switch_frames = 0U;
+        diagnostic_selection_reason = "confirmed_switch";
+    }
+    else if (!selected_state.valid)
     {
         selected_state.filtered_distance_m = selected_distance_m;
+        selected_state.peak_bin = selected->peak_bin;
         selected_state.valid = true;
+        selected_state.switch_frames = 0U;
+        diagnostic_selection_reason = "new_motion_target";
+    }
+    else if (target_jump)
+    {
+        selected_state.filtered_distance_m = selected_distance_m;
+        selected_state.peak_bin = selected->peak_bin;
+        selected_state.switch_frames = 0U;
+        diagnostic_selection_reason = "tracked_motion";
     }
     else
     {
         selected_state.filtered_distance_m += APP_RADAR_DISTANCE_ALPHA *
                                               (selected_distance_m - selected_state.filtered_distance_m);
+        selected_state.peak_bin = selected->peak_bin;
+        selected_state.switch_frames = 0U;
+        diagnostic_selection_reason = "tracked_motion";
     }
 
     selected_state.missed_frames = 0U;
+    selected_state.confidence = clamp_float(selected->candidate_score, 0.0f, 100.0f);
+    diagnostic_selected_bin = selected->peak_bin;
     publish_presence_distance(true, true, selected_state.filtered_distance_m);
     absence_frames = 0U;
 }
@@ -535,21 +908,25 @@ static void log_range_diagnostics(const radar_target_t *targets, uint8_t target_
 
     if (latest_result.distance_valid && (target_count > 0U))
     {
-        const radar_target_t *nearest = &targets[0];
-        for (uint8_t i = 1U; i < target_count; i++)
+        const radar_target_t *selected = NULL;
+        for (uint8_t i = 0U; i < target_count; i++)
         {
-            if (targets[i].distance_m < nearest->distance_m)
+            if (targets[i].peak_bin == diagnostic_selected_bin)
             {
-                nearest = &targets[i];
+                selected = &targets[i];
+                break;
             }
         }
-        selected_bin = nearest->peak_bin;
-        peak_strength = nearest->strength;
-        noise_floor = nearest->noise_floor;
-        snr = nearest->snr;
+        if (NULL != selected)
+        {
+            selected_bin = selected->peak_bin;
+            peak_strength = selected->strength;
+            noise_floor = selected->noise_floor;
+            snr = selected->snr;
+        }
     }
 
-    RADAR_LOG("frame=%lu presence=%u selected_rule=nearest selected_bin=%u distance_m=%.2f peak_strength=%.0f noise_floor=%.0f snr=%.1f distance_valid=%u published_distance=%u",
+    RADAR_LOG("frame=%lu presence=%u selected_rule=motion_score selected_bin=%u distance_m=%.2f peak_strength=%.0f noise_floor=%.0f snr=%.1f distance_valid=%u published_distance=%u",
               (unsigned long)latest_result.frame_counter,
               latest_result.presence_detected ? 1U : 0U,
               (unsigned int)selected_bin,
@@ -565,6 +942,47 @@ static void log_range_diagnostics(const radar_target_t *targets, uint8_t target_
 }
 #endif
 
+static void log_candidate_diagnostics(const radar_target_t *targets, uint8_t target_count)
+{
+    static TickType_t last_candidate_log_tick;
+    TickType_t now = xTaskGetTickCount();
+
+    if ((now - last_candidate_log_tick) < pdMS_TO_TICKS(APP_RADAR_CANDIDATE_DIAG_PERIOD_MS))
+    {
+        return;
+    }
+    last_candidate_log_tick = now;
+
+    for (uint8_t i = 0U; i < target_count; i++)
+    {
+        bool selected = (targets[i].peak_bin == diagnostic_selected_bin) &&
+                        latest_result.distance_valid;
+        printf("[RADAR-CAND] bin=%u distance=%.2f power=%.0f snr=%.1f motion=%.2f micro=%.2f motion_noise=%.0f persist=%u presence_match=%.1f static=%u score=%.2f required_score=%.2f state=%s result=%s reason=%s\r\n",
+               (unsigned int)targets[i].peak_bin,
+               (double)targets[i].distance_m,
+               (double)targets[i].strength,
+               (double)targets[i].snr,
+               (double)targets[i].short_motion_score,
+               (double)targets[i].micro_motion_score,
+               (double)targets[i].motion_noise,
+               (unsigned int)targets[i].motion_persistence,
+               (double)targets[i].presence_bin_score,
+               (targets[i].static_penalty > 0.0f) ? 1U : 0U,
+               (double)targets[i].candidate_score,
+               (double)targets[i].required_score,
+               targets[i].state_name,
+               selected ? "selected" : "rejected",
+               selected ? "SELECTED" : targets[i].reject_reason);
+    }
+
+    printf("[RADAR-SELECT] bin=%u distance=%.2f reason=%s confidence=%.1f active_presence_bin=%ld\r\n",
+           (unsigned int)diagnostic_selected_bin,
+           (double)latest_result.distance_m,
+           diagnostic_selection_reason,
+           (double)selected_state.confidence,
+           (long)active_presence_bin);
+}
+
 static void presence_callback(xensiv_radar_presence_handle_t handle,
                               const xensiv_radar_presence_event_t *event,
                               void *data)
@@ -578,6 +996,7 @@ static void presence_callback(xensiv_radar_presence_handle_t handle,
     }
 
     motion_presence_detected = (XENSIV_RADAR_PRESENCE_STATE_ABSENCE != event->state);
+    active_presence_bin = motion_presence_detected ? event->range_bin : -1;
 }
 
 static void invalidate_after_absence(void)
@@ -828,6 +1247,7 @@ cy_rslt_t radar_init(void)
     }
 
     init_range_window();
+    initialize_motion_history();
     radar_bin_length_m = ifx_range_resolution(APP_RADAR_BANDWIDTH_HZ);
     min_range_bin = clamp_bin((int32_t)ceilf(APP_RADAR_MIN_DISTANCE_M / radar_bin_length_m));
     max_range_bin = clamp_bin((int32_t)floorf(APP_RADAR_MAX_DISTANCE_M / radar_bin_length_m));
@@ -996,6 +1416,7 @@ cy_rslt_t radar_process(void)
 
     set_radar_state(RADAR_STATE_PROCESSING_FRAME);
     build_range_profile();
+    update_temporal_motion_features();
 
     int32_t presence_status = xensiv_radar_presence_process_frame(presence_handle,
                                                                   radar_float_frame,
@@ -1017,12 +1438,20 @@ cy_rslt_t radar_process(void)
     if (xensiv_radar_presence_get_max_macro(presence_handle, &macro, &macro_index))
     {
         latest_result.presence_score = macro;
+        if (motion_presence_detected && (macro_index >= 0))
+        {
+            active_presence_bin = macro_index;
+        }
         RADAR_VERBOSE("macro score=%.3f bin=%d", (double)macro, macro_index);
     }
     if (xensiv_radar_presence_get_max_micro(presence_handle, &micro, &micro_index) &&
         (micro > latest_result.presence_score))
     {
         latest_result.presence_score = micro;
+        if (motion_presence_detected && (micro_index >= 0))
+        {
+            active_presence_bin = micro_index;
+        }
         RADAR_VERBOSE("micro score=%.3f bin=%d", (double)micro, micro_index);
     }
 
@@ -1033,22 +1462,23 @@ cy_rslt_t radar_process(void)
     float raw_distance_m = 0.0f;
     if (confirmed_count > 0U)
     {
-        const radar_target_t *nearest = &candidate_targets[0];
+        const radar_target_t *best = &candidate_targets[0];
         for (uint8_t i = 1U; i < confirmed_count; i++)
         {
-            if (candidate_targets[i].distance_m < nearest->distance_m)
+            if (candidate_targets[i].candidate_score > best->candidate_score)
             {
-                nearest = &candidate_targets[i];
+                best = &candidate_targets[i];
             }
         }
-        raw_peak_bin = nearest->peak_bin;
-        raw_distance_m = nearest->distance_m;
+        raw_peak_bin = best->peak_bin;
+        raw_distance_m = best->distance_m;
     }
 
     latest_result.frame_counter++;
     update_selected_distance(candidate_targets, confirmed_count);
     copy_current_targets(candidate_targets, candidate_count);
     invalidate_after_absence();
+    age_provisional_protection();
 
     if (!presence_state_reported || (latest_result.presence_detected != last_presence_state))
     {
@@ -1060,6 +1490,7 @@ cy_rslt_t radar_process(void)
 #if APP_RADAR_VERBOSE_DIAGNOSTICS
     log_range_diagnostics(candidate_targets, confirmed_count);
 #endif
+    log_candidate_diagnostics(candidate_targets, confirmed_count);
     log_radar_liveness(raw_peak_bin,
                        raw_distance_m,
                        latest_result.distance_m,
