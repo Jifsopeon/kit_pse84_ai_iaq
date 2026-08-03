@@ -253,6 +253,107 @@ static wiced_bt_gatt_status_t app_read_handler(uint16_t conn_id_value,
     return WICED_BT_GATT_SUCCESS;
 }
 
+static wiced_bt_gatt_status_t app_read_by_type_handler(uint16_t conn_id_value,
+                                                       wiced_bt_gatt_opcode_t opcode,
+                                                       wiced_bt_gatt_read_by_type_t *read_data,
+                                                       uint16_t len_requested)
+{
+    uint16_t attr_handle = read_data->s_handle;
+    uint16_t error_handle = read_data->s_handle;
+    uint8_t pair_len = 0U;
+    int used_len = 0;
+    wiced_bt_gatt_status_t status = WICED_BT_GATT_SUCCESS;
+    uint8_t *response = app_gatt_response_buffer_alloc(len_requested);
+
+    if (LEN_UUID_16 == read_data->uuid.len)
+    {
+        APP_BLE_DEBUG("read by type start=0x%04X end=0x%04X uuid16=0x%04X len_requested=%u",
+                      read_data->s_handle,
+                      read_data->e_handle,
+                      read_data->uuid.uu.uuid16,
+                      len_requested);
+    }
+    else
+    {
+        APP_BLE_DEBUG("read by type start=0x%04X end=0x%04X uuid_len=%u len_requested=%u",
+                      read_data->s_handle,
+                      read_data->e_handle,
+                      read_data->uuid.len,
+                      len_requested);
+    }
+
+    if (NULL == response)
+    {
+        wiced_bt_gatt_server_send_error_rsp(conn_id_value, opcode, error_handle,
+                                            WICED_BT_GATT_INSUF_RESOURCE);
+        return WICED_BT_GATT_INSUF_RESOURCE;
+    }
+
+    while (true)
+    {
+        attr_handle = wiced_bt_gatt_find_handle_by_type(attr_handle,
+                                                        read_data->e_handle,
+                                                        &read_data->uuid);
+        if (0U == attr_handle)
+        {
+            break;
+        }
+
+        error_handle = attr_handle;
+        gatt_db_lookup_table_t *attribute = app_get_attribute(attr_handle);
+        if (NULL == attribute)
+        {
+            APP_BLE_DEBUG("read by type found non-external attribute handle=0x%04X", attr_handle);
+            status = WICED_BT_GATT_INVALID_HANDLE;
+            break;
+        }
+
+        int filled = wiced_bt_gatt_put_read_by_type_rsp_in_stream(response + used_len,
+                                                                  (int)len_requested - used_len,
+                                                                  &pair_len,
+                                                                  attr_handle,
+                                                                  attribute->cur_len,
+                                                                  attribute->p_data);
+        if (0 == filled)
+        {
+            break;
+        }
+
+        used_len += filled;
+        attr_handle++;
+    }
+
+    if ((WICED_BT_GATT_SUCCESS == status) && (0 == used_len))
+    {
+        APP_BLE_DEBUG("read by type no attributes start=0x%04X end=0x%04X",
+                      read_data->s_handle,
+                      read_data->e_handle);
+        status = WICED_BT_GATT_INVALID_HANDLE;
+    }
+
+    if (WICED_BT_GATT_SUCCESS == status)
+    {
+        status = wiced_bt_gatt_server_send_read_by_type_rsp(conn_id_value,
+                                                            opcode,
+                                                            pair_len,
+                                                            (uint16_t)used_len,
+                                                            response,
+                                                            (void *)app_gatt_response_buffer_free);
+        APP_BLE_DEBUG("read by type response status=%d pair_len=%u used_len=%d",
+                      status,
+                      pair_len,
+                      used_len);
+        if (WICED_BT_GATT_SUCCESS == status)
+        {
+            return WICED_BT_GATT_SUCCESS;
+        }
+    }
+
+    app_gatt_response_buffer_free(response);
+    wiced_bt_gatt_server_send_error_rsp(conn_id_value, opcode, error_handle, status);
+    return status;
+}
+
 static wiced_bt_gatt_status_t app_write_handler(uint16_t conn_id_value,
                                                 wiced_bt_gatt_opcode_t opcode,
                                                 wiced_bt_gatt_write_req_t *write_data)
@@ -350,6 +451,13 @@ static wiced_bt_gatt_status_t app_attribute_request_handler(wiced_bt_gatt_attrib
             APP_BLE_DEBUG("attribute read opcode=0x%02X", request->opcode);
             result = app_read_handler(request->conn_id, request->opcode,
                                       &request->data.read_req, request->len_requested);
+            break;
+
+        case GATT_REQ_READ_BY_TYPE:
+            APP_BLE_DEBUG("attribute read by type opcode=0x%02X", request->opcode);
+            result = app_read_by_type_handler(request->conn_id, request->opcode,
+                                              &request->data.read_by_type,
+                                              request->len_requested);
             break;
 
         case GATT_REQ_WRITE:
