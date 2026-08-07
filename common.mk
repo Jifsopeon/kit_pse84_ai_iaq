@@ -51,6 +51,10 @@ TOOLCHAIN=GCC_ARM
 # launch configurations for your IDE.
 CONFIG=Debug
 
+# This project carries BSP GeneratedSource changes for the CM55 display/ML
+# integration, so builds must use the checked-in generated files.
+SKIP_CODE_GEN=1
+
 # Config file for postbuild sign and merge operations.
 # NOTE: Check the JSON file for the command parameters
 COMBINE_SIGN_JSON?=configs/boot_with_extended_boot.json

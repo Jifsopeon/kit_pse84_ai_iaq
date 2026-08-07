@@ -52,7 +52,9 @@ VERBOSE=
 # ... then code in directories named COMPONENT_foo and COMPONENT_bar will be
 # added to the build
 #
-COMPONENTS+=FREERTOS RTOS_AWARE WICED_BLE
+SEARCH+=../components
+
+COMPONENTS+=FREERTOS RTOS_AWARE WICED_BLE SHARED_MEM
 
 # Like COMPONENTS, but disable optional code that was enabled by default.
 DISABLE_COMPONENTS=
@@ -71,7 +73,7 @@ SOURCES+=
 INCLUDES+=GeneratedSource source source/sen66 source/model source/prediction
 
 # Add additional defines to the build process (without a leading -D).
-DEFINES+=CY_RETARGET_IO_CONVERT_LF_TO_CRLF CY_RTOS_AWARE CYBSP_BT_PLATFORM_CFG_BAUD_FEATURE=3000000
+DEFINES+=CY_RETARGET_IO_CONVERT_LF_TO_CRLF CY_RTOS_AWARE CYBSP_BT_PLATFORM_CFG_BAUD_FEATURE=3000000 APP_CM55_STARTUP_DIAGNOSTICS=1
 
 # Select softfp or hardfp floating point. Default is softfp.
 VFP_SELECT+=
@@ -133,6 +135,4 @@ CY_GETLIBS_SHARED_PATH=../..
 CY_GETLIBS_SHARED_NAME=mtb_shared
 
 include $(CY_TOOLS_DIR)/make/start.mk
-
-
 

@@ -133,6 +133,7 @@ static bool distance_is_plausible(float distance_m)
            (distance_m <= APP_RADAR_MAX_DISTANCE_M);
 }
 
+#if APP_RADAR_DIAGNOSTICS_ENABLED || APP_RADAR_VERBOSE_DIAGNOSTICS
 static const char *radar_state_name(radar_state_t state)
 {
     switch (state)
@@ -155,6 +156,7 @@ static const char *radar_state_name(radar_state_t state)
             return "UNKNOWN";
     }
 }
+#endif
 
 static void set_radar_state(radar_state_t state)
 {
@@ -944,6 +946,7 @@ static void log_range_diagnostics(const radar_target_t *targets, uint8_t target_
 
 static void log_candidate_diagnostics(const radar_target_t *targets, uint8_t target_count)
 {
+#if APP_RADAR_VERBOSE_DIAGNOSTICS
     static TickType_t last_candidate_log_tick;
     TickType_t now = xTaskGetTickCount();
 
@@ -981,6 +984,10 @@ static void log_candidate_diagnostics(const radar_target_t *targets, uint8_t tar
            diagnostic_selection_reason,
            (double)selected_state.confidence,
            (long)active_presence_bin);
+#else
+    CY_UNUSED_PARAMETER(targets);
+    CY_UNUSED_PARAMETER(target_count);
+#endif
 }
 
 static void presence_callback(xensiv_radar_presence_handle_t handle,

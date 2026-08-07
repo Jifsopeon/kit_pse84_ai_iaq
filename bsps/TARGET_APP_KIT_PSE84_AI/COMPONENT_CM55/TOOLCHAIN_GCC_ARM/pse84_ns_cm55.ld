@@ -97,7 +97,7 @@ SECTIONS
 
     /* This section is intended to hold the main application code for the Cortex-M55 */
     /* Performance-sensitive or critical functions that need to be executed in sram are manually excluded */
-    .app_code_main : ALIGN(VECTORS_ALIGNMENT)
+    .app_code_main(READONLY) : ALIGN(VECTORS_ALIGNMENT)
     {
         __text_begin = .;
         __Vectors = . ;
@@ -369,5 +369,14 @@ SECTIONS
     .cy_trailer(NOLOAD) :
     {
     } > m55_trailer_sel
+
+    .cy_xip (NOLOAD):
+    {
+        . = ALIGN(4);
+        __cy_xip_start = .;
+        KEEP(*(.cy_xip))
+        . = ALIGN(4);
+        __cy_xip_end = .;
+    } > CM55_PSRAM
 
 }
