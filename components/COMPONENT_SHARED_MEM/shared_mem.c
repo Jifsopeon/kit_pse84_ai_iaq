@@ -69,6 +69,11 @@ size_t app_shared_data_size(void)
     return sizeof(app_shared_data_t);
 }
 
+uintptr_t app_shared_data_end_address(void)
+{
+    return (uintptr_t)app_shared_data() + sizeof(app_shared_data_t);
+}
+
 static void shared_cache_clean_invalidate(void)
 {
 #if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
@@ -140,21 +145,89 @@ void app_cm55_boot_mark(app_cm55_boot_mark_t mark)
 
     switch (mark)
     {
-        case APP_CM55_BOOT_MARK_BOOT:
-            state->state = APP_CM55_BOOT_RESET;
+        case APP_CM55_BOOT_MARK_RESET_HANDLER:
+            state->state = APP_CM55_BOOT_RESET_HANDLER;
+            state->last_state = state->state;
             state->boot_entered++;
             break;
-        case APP_CM55_BOOT_MARK_MAIN:
-            state->state = APP_CM55_BOOT_MAIN;
+        case APP_CM55_BOOT_MARK_SYSTEM_INIT_ENTER:
+            state->state = APP_CM55_BOOT_SYSTEM_INIT_ENTER;
+            state->last_state = state->state;
+            break;
+        case APP_CM55_BOOT_MARK_SYSTEM_INIT_DONE:
+            state->state = APP_CM55_BOOT_SYSTEM_INIT_DONE;
+            state->last_state = state->state;
+            break;
+        case APP_CM55_BOOT_MARK_CRT_INIT_ENTER:
+            state->state = APP_CM55_BOOT_CRT_INIT_ENTER;
+            state->last_state = state->state;
+            break;
+        case APP_CM55_BOOT_MARK_MAIN_ENTER:
+            state->state = APP_CM55_BOOT_MAIN_ENTER;
+            state->last_state = state->state;
             state->main_entered++;
             break;
-        case APP_CM55_BOOT_MARK_RTOS:
-            state->state = APP_CM55_BOOT_RTOS;
+        case APP_CM55_BOOT_MARK_PLATFORM_INIT_ENTER:
+            state->state = APP_CM55_BOOT_PLATFORM_INIT_ENTER;
+            state->last_state = state->state;
+            break;
+        case APP_CM55_BOOT_MARK_PLATFORM_INIT_DONE:
+            state->state = APP_CM55_BOOT_PLATFORM_INIT_DONE;
+            state->last_state = state->state;
+            break;
+        case APP_CM55_BOOT_MARK_PSRAM_INIT_ENTER:
+            state->state = APP_CM55_BOOT_PSRAM_INIT_ENTER;
+            state->last_state = state->state;
+            break;
+        case APP_CM55_BOOT_MARK_PSRAM_INIT_DONE:
+            state->state = APP_CM55_BOOT_PSRAM_INIT_DONE;
+            state->last_state = state->state;
+            break;
+        case APP_CM55_BOOT_MARK_RTOS_CREATE:
+            state->state = APP_CM55_BOOT_RTOS_CREATE;
+            state->last_state = state->state;
+            break;
+        case APP_CM55_BOOT_MARK_SCHEDULER_STARTED:
+            state->state = APP_CM55_BOOT_SCHEDULER_STARTED;
+            state->last_state = state->state;
             state->rtos_started++;
             break;
-        case APP_CM55_BOOT_MARK_APP_INIT:
-            state->state = APP_CM55_BOOT_APP;
+        case APP_CM55_BOOT_MARK_APP_INIT_ENTER:
+            state->state = APP_CM55_BOOT_APP_INIT_ENTER;
+            state->last_state = state->state;
             state->app_init_entered++;
+            break;
+        case APP_CM55_BOOT_MARK_DISPLAY_INIT_ENTER:
+            state->state = APP_CM55_BOOT_DISPLAY_INIT_ENTER;
+            state->last_state = state->state;
+            break;
+        case APP_CM55_BOOT_MARK_USB_INIT_ENTER:
+            state->state = APP_CM55_BOOT_USB_INIT_ENTER;
+            state->last_state = state->state;
+            break;
+        case APP_CM55_BOOT_MARK_MODEL_INIT_ENTER:
+            state->state = APP_CM55_BOOT_MODEL_INIT_ENTER;
+            state->last_state = state->state;
+            break;
+        case APP_CM55_BOOT_MARK_DISPLAY_INIT_DONE:
+            state->state = APP_CM55_BOOT_DISPLAY_INIT_DONE;
+            state->last_state = state->state;
+            break;
+        case APP_CM55_BOOT_MARK_USB_INIT_DONE:
+            state->state = APP_CM55_BOOT_USB_INIT_DONE;
+            state->last_state = state->state;
+            break;
+        case APP_CM55_BOOT_MARK_MODEL_INIT_DONE:
+            state->state = APP_CM55_BOOT_MODEL_INIT_DONE;
+            state->last_state = state->state;
+            break;
+        case APP_CM55_BOOT_MARK_CAMERA_INIT_ENTER:
+            state->state = APP_CM55_BOOT_CAMERA_INIT_ENTER;
+            state->last_state = state->state;
+            break;
+        case APP_CM55_BOOT_MARK_CAMERA_INIT_DONE:
+            state->state = APP_CM55_BOOT_CAMERA_INIT_DONE;
+            state->last_state = state->state;
             break;
         default:
             break;
@@ -174,6 +247,52 @@ void app_cm55_boot_fault(uint32_t fault)
     }
     state->state = APP_CM55_BOOT_FAULT;
     state->fault = fault;
+    shared_cache_clean();
+}
+
+void app_cm55_fault_capture(uint32_t fault, uint32_t exc_return, const app_cm55_exception_frame_t *frame)
+{
+    app_cm55_boot_state_t *state = &app_shared_data()->boot_state;
+
+    shared_cache_clean_invalidate();
+    if (state->magic != APP_CM55_BOOT_STATE_MAGIC)
+    {
+        state->magic = APP_CM55_BOOT_STATE_MAGIC;
+    }
+
+    state->state = APP_CM55_BOOT_FAULT;
+    state->fault = fault;
+    state->exc_return = exc_return;
+    state->msp = __get_MSP();
+    state->psp = __get_PSP();
+    state->control = __get_CONTROL();
+    state->primask = __get_PRIMASK();
+    state->basepri = __get_BASEPRI();
+    state->faultmask = __get_FAULTMASK();
+    state->msplim = __get_MSPLIM();
+    state->psplim = __get_PSPLIM();
+
+    if (NULL != frame)
+    {
+        state->r0 = frame->r0;
+        state->r1 = frame->r1;
+        state->r2 = frame->r2;
+        state->r3 = frame->r3;
+        state->r12 = frame->r12;
+        state->lr = frame->lr;
+        state->pc = frame->pc;
+        state->xpsr = frame->xpsr;
+    }
+
+    state->cfsr = SCB->CFSR;
+    state->hfsr = SCB->HFSR;
+    state->dfsr = SCB->DFSR;
+    state->afsr = SCB->AFSR;
+    state->mmfar = SCB->MMFAR;
+    state->bfar = SCB->BFAR;
+    state->shcsr = SCB->SHCSR;
+    state->icsr = SCB->ICSR;
+    state->vtor = SCB->VTOR;
     shared_cache_clean();
 }
 

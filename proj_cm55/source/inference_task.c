@@ -277,6 +277,7 @@ void cm55_inference_task( void *arg )
     }
     else
     {
+        app_cm55_send_event(APP_EVENT_CM55_MODEL_INIT_DONE);
         app_cm55_send_event(APP_EVENT_MODEL_INITIALIZED);
     }
 

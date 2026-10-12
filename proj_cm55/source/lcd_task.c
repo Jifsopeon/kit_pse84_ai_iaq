@@ -1010,6 +1010,8 @@ void cm55_ns_gfx_task(void *arg)
         VG_LITE_ERROR_EXIT("Clear failed: vg_lite_clear() returned error %d\r\n", vglite_status);
     }
 
+    app_cm55_send_event(APP_EVENT_CM55_DISPLAY_INIT_DONE);
+
     /* Define the transformation matrix for camera image to display */
     vg_lite_identity(&matrix);
     float scale_cam_to_disp_x = (float)(DISPLAY_WIDTH) / (float)CAMERA_WIDTH;

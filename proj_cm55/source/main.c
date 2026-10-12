@@ -334,14 +334,84 @@ uint32_t calculate_idle_percentage(void)
 *  int
 *
 *******************************************************************************/
-void HardFault_Handler(void)
+__attribute__((noreturn)) void cm55_fault_dispatch(uint32_t *fault_stack, uint32_t exc_return, uint32_t fault)
 {
 #if APP_CM55_STARTUP_DIAGNOSTICS
-    app_cm55_boot_fault(APP_CM55_BOOT_FAULT);
+    app_cm55_fault_capture(fault, exc_return, (const app_cm55_exception_frame_t *)fault_stack);
+#else
+    (void)fault_stack;
+    (void)exc_return;
+    (void)fault;
 #endif
+
     for (;;)
     {
     }
+}
+
+__attribute__((naked)) void HardFault_Handler(void)
+{
+    __asm volatile(
+        "tst lr, #4\n"
+        "ite eq\n"
+        "mrseq r0, msp\n"
+        "mrsne r0, psp\n"
+        "mov r1, lr\n"
+        "ldr r2, =0x55FF0001\n"
+        "b cm55_fault_dispatch\n"
+    );
+}
+
+__attribute__((naked)) void MemManage_Handler(void)
+{
+    __asm volatile(
+        "tst lr, #4\n"
+        "ite eq\n"
+        "mrseq r0, msp\n"
+        "mrsne r0, psp\n"
+        "mov r1, lr\n"
+        "ldr r2, =0x55FF0002\n"
+        "b cm55_fault_dispatch\n"
+    );
+}
+
+__attribute__((naked)) void BusFault_Handler(void)
+{
+    __asm volatile(
+        "tst lr, #4\n"
+        "ite eq\n"
+        "mrseq r0, msp\n"
+        "mrsne r0, psp\n"
+        "mov r1, lr\n"
+        "ldr r2, =0x55FF0003\n"
+        "b cm55_fault_dispatch\n"
+    );
+}
+
+__attribute__((naked)) void UsageFault_Handler(void)
+{
+    __asm volatile(
+        "tst lr, #4\n"
+        "ite eq\n"
+        "mrseq r0, msp\n"
+        "mrsne r0, psp\n"
+        "mov r1, lr\n"
+        "ldr r2, =0x55FF0004\n"
+        "b cm55_fault_dispatch\n"
+    );
+}
+
+__attribute__((naked)) void DebugMon_Handler(void)
+{
+    __asm volatile(
+        "tst lr, #4\n"
+        "ite eq\n"
+        "mrseq r0, msp\n"
+        "mrsne r0, psp\n"
+        "mov r1, lr\n"
+        "ldr r2, =0x55FF0005\n"
+        "b cm55_fault_dispatch\n"
+    );
 }
 
 int main ( void )
@@ -349,10 +419,13 @@ int main ( void )
     cy_rslt_t   result;
 
 #if APP_CM55_STARTUP_DIAGNOSTICS
-    app_cm55_startup_diagnostic(APP_EVENT_CM55_BOOT_ENTERED, APP_CM55_BOOT_MARK_BOOT);
+    app_cm55_startup_diagnostic(APP_EVENT_CM55_MAIN_ENTERED, APP_CM55_BOOT_MARK_MAIN_ENTER);
 #endif
 
     /* Initialize the device and board peripherals */
+#if APP_CM55_STARTUP_DIAGNOSTICS
+    app_cm55_boot_mark(APP_CM55_BOOT_MARK_PLATFORM_INIT_ENTER);
+#endif
     result = cybsp_init();
     if ( CY_RSLT_SUCCESS != result ) {
         /* Board init failed. Stop program execution */
@@ -360,7 +433,7 @@ int main ( void )
     }
 
 #if APP_CM55_STARTUP_DIAGNOSTICS
-    app_cm55_startup_diagnostic(APP_EVENT_CM55_MAIN_ENTERED, APP_CM55_BOOT_MARK_MAIN);
+    app_cm55_boot_mark(APP_CM55_BOOT_MARK_PLATFORM_INIT_DONE);
 #endif
 
     /* Enable global interrupts */
@@ -372,6 +445,9 @@ int main ( void )
     ifx_time_start();
 
     /* Initialize PSRAM and set-up serial memory */
+#if APP_CM55_STARTUP_DIAGNOSTICS
+    app_cm55_boot_mark(APP_CM55_BOOT_MARK_PSRAM_INIT_ENTER);
+#endif
     smif_ospi_psram_init();
 
     check_status("smif_ospi_psram_init error", (uint32_t)result);
@@ -385,10 +461,14 @@ int main ( void )
     check_status("mtb_serial_memory_set_write_enable: failed", result);
 
 #if APP_CM55_STARTUP_DIAGNOSTICS
-    app_cm55_startup_diagnostic(APP_EVENT_CM55_APP_INIT_ENTERED, APP_CM55_BOOT_MARK_APP_INIT);
+    app_cm55_boot_mark(APP_CM55_BOOT_MARK_PSRAM_INIT_DONE);
+    app_cm55_startup_diagnostic(APP_EVENT_CM55_APP_INIT_ENTERED, APP_CM55_BOOT_MARK_APP_INIT_ENTER);
 #endif
 
     /* \x1b[2J\x1b[;H - ANSI ESC sequence for clear screen */
+#if APP_CM55_STARTUP_DIAGNOSTICS
+    app_cm55_boot_mark(APP_CM55_BOOT_MARK_RTOS_CREATE);
+#endif
     result = cy_rtos_semaphore_init(&usb_semaphore, NUM_IMAGE_BUFFERS, 0);
     if ( CY_RSLT_SUCCESS != result ) {
         CY_ASSERT(0);
@@ -437,7 +517,7 @@ int main ( void )
 #endif
     /* Start the RTOS Scheduler */
 #if APP_CM55_STARTUP_DIAGNOSTICS
-    app_cm55_startup_diagnostic(APP_EVENT_CM55_RTOS_STARTED, APP_CM55_BOOT_MARK_RTOS);
+    app_cm55_startup_diagnostic(APP_EVENT_CM55_RTOS_STARTED, APP_CM55_BOOT_MARK_SCHEDULER_STARTED);
 #endif
     vTaskStartScheduler();
 

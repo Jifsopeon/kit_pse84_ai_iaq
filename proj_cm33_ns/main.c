@@ -154,12 +154,20 @@ static const char *app_event_to_string(app_event_t event)
             return "[CM55] App init";
         case APP_EVENT_CM55_DISPLAY_INIT_ENTERED:
             return "[CM55] Display init";
+        case APP_EVENT_CM55_DISPLAY_INIT_DONE:
+            return "[CM55] Display init done";
         case APP_EVENT_CM55_USB_INIT_ENTERED:
             return "[CM55] USB init";
+        case APP_EVENT_CM55_USB_INIT_DONE:
+            return "[CM55] USB init done";
         case APP_EVENT_CM55_CAMERA_INIT_ENTERED:
             return "[CM55] Camera init";
+        case APP_EVENT_CM55_CAMERA_INIT_DONE:
+            return "[CM55] Camera init done";
         case APP_EVENT_CM55_MODEL_INIT_ENTERED:
             return "[CM55] Model init";
+        case APP_EVENT_CM55_MODEL_INIT_DONE:
+            return "[CM55] Model init done";
         case APP_EVENT_CM55_VIDEO_TASK_STARTED:
             return "[CM55] Video task";
         default:
@@ -846,7 +854,7 @@ static void print_cm55_start_status(const char *phase)
     uint32_t reset = vector_table[1];
     uint32_t core_status = Cy_SysGetCM55Status(MXCM55);
 
-    printf("[CM55 START] %s vector=0x%08lx msp=0x%08lx reset=0x%08lx core=%lu pd1=%lu appcpuss=%lu appcpu=%lu socmem=%lu shared=0x%08lx size=%lu api=void\r\n",
+    printf("[CM55 START] %s vector=0x%08lx msp=0x%08lx reset=0x%08lx core=%lu pd1=%lu appcpuss=%lu appcpu=%lu socmem=%lu shared=0x%08lx end=0x%08lx size=%lu api=void\r\n",
            phase,
            (unsigned long)CM55_APP_BOOT_ADDR,
            (unsigned long)msp,
@@ -857,13 +865,143 @@ static void print_cm55_start_status(const char *phase)
            (unsigned long)cm55_ppu_power_mode(PPU_CM55_0),
            (unsigned long)cm55_ppu_power_mode(SOCMEM_PPU_SOCMEM),
            (unsigned long)app_shared_data_address(),
+           (unsigned long)app_shared_data_end_address(),
            (unsigned long)app_shared_data_size());
+}
+
+static const char *cm55_boot_state_to_string(uint32_t state)
+{
+    switch (state)
+    {
+        case APP_CM55_BOOT_NONE: return "NONE";
+        case APP_CM55_BOOT_RESET_HANDLER: return "RESET_HANDLER";
+        case APP_CM55_BOOT_SYSTEM_INIT_ENTER: return "SYSTEM_INIT_ENTER";
+        case APP_CM55_BOOT_SYSTEM_INIT_DONE: return "SYSTEM_INIT_DONE";
+        case APP_CM55_BOOT_CRT_INIT_ENTER: return "CRT_INIT_ENTER";
+        case APP_CM55_BOOT_MAIN_ENTER: return "MAIN_ENTER";
+        case APP_CM55_BOOT_PLATFORM_INIT_ENTER: return "PLATFORM_INIT_ENTER";
+        case APP_CM55_BOOT_PLATFORM_INIT_DONE: return "PLATFORM_INIT_DONE";
+        case APP_CM55_BOOT_PSRAM_INIT_ENTER: return "PSRAM_INIT_ENTER";
+        case APP_CM55_BOOT_PSRAM_INIT_DONE: return "PSRAM_INIT_DONE";
+        case APP_CM55_BOOT_RTOS_CREATE: return "RTOS_CREATE";
+        case APP_CM55_BOOT_SCHEDULER_STARTED: return "SCHEDULER_STARTED";
+        case APP_CM55_BOOT_APP_INIT_ENTER: return "APP_INIT_ENTER";
+        case APP_CM55_BOOT_DISPLAY_INIT_ENTER: return "DISPLAY_INIT_ENTER";
+        case APP_CM55_BOOT_USB_INIT_ENTER: return "USB_INIT_ENTER";
+        case APP_CM55_BOOT_MODEL_INIT_ENTER: return "MODEL_INIT_ENTER";
+        case APP_CM55_BOOT_DISPLAY_INIT_DONE: return "DISPLAY_INIT_DONE";
+        case APP_CM55_BOOT_USB_INIT_DONE: return "USB_INIT_DONE";
+        case APP_CM55_BOOT_MODEL_INIT_DONE: return "MODEL_INIT_DONE";
+        case APP_CM55_BOOT_CAMERA_INIT_ENTER: return "CAMERA_INIT_ENTER";
+        case APP_CM55_BOOT_CAMERA_INIT_DONE: return "CAMERA_INIT_DONE";
+        case APP_CM55_BOOT_FAULT: return "FAULT";
+        default: return "UNKNOWN";
+    }
+}
+
+static const char *cm55_fault_to_string(uint32_t fault)
+{
+    switch (fault)
+    {
+        case APP_CM55_FAULT_HARDFAULT: return "HardFault";
+        case APP_CM55_FAULT_MEMMANAGE: return "MemManage";
+        case APP_CM55_FAULT_BUSFAULT: return "BusFault";
+        case APP_CM55_FAULT_USAGEFAULT: return "UsageFault";
+        case APP_CM55_FAULT_DEBUGMON: return "DebugMon";
+        default: return "Unknown";
+    }
+}
+
+static void print_cfsr_bits(uint32_t cfsr)
+{
+    printf("[CM55 FAULT] MMFSR:");
+    if (0U == (cfsr & 0x000000FFUL)) { printf(" none"); }
+    if (0U != (cfsr & (1UL << 0))) { printf(" IACCVIOL"); }
+    if (0U != (cfsr & (1UL << 1))) { printf(" DACCVIOL"); }
+    if (0U != (cfsr & (1UL << 3))) { printf(" MUNSTKERR"); }
+    if (0U != (cfsr & (1UL << 4))) { printf(" MSTKERR"); }
+    if (0U != (cfsr & (1UL << 5))) { printf(" MLSPERR"); }
+    if (0U != (cfsr & (1UL << 7))) { printf(" MMARVALID"); }
+    printf("\r\n");
+
+    printf("[CM55 FAULT] BFSR:");
+    if (0U == (cfsr & 0x0000FF00UL)) { printf(" none"); }
+    if (0U != (cfsr & (1UL << 8))) { printf(" IBUSERR"); }
+    if (0U != (cfsr & (1UL << 9))) { printf(" PRECISERR"); }
+    if (0U != (cfsr & (1UL << 10))) { printf(" IMPRECISERR"); }
+    if (0U != (cfsr & (1UL << 11))) { printf(" UNSTKERR"); }
+    if (0U != (cfsr & (1UL << 12))) { printf(" STKERR"); }
+    if (0U != (cfsr & (1UL << 13))) { printf(" LSPERR"); }
+    if (0U != (cfsr & (1UL << 15))) { printf(" BFARVALID"); }
+    printf("\r\n");
+
+    printf("[CM55 FAULT] UFSR:");
+    if (0U == (cfsr & 0xFFFF0000UL)) { printf(" none"); }
+    if (0U != (cfsr & (1UL << 16))) { printf(" UNDEFINSTR"); }
+    if (0U != (cfsr & (1UL << 17))) { printf(" INVSTATE"); }
+    if (0U != (cfsr & (1UL << 18))) { printf(" INVPC"); }
+    if (0U != (cfsr & (1UL << 19))) { printf(" NOCP"); }
+    if (0U != (cfsr & (1UL << 20))) { printf(" STKOF"); }
+    if (0U != (cfsr & (1UL << 24))) { printf(" UNALIGNED"); }
+    if (0U != (cfsr & (1UL << 25))) { printf(" DIVBYZERO"); }
+    printf("\r\n");
+}
+
+static void print_hfsr_bits(uint32_t hfsr)
+{
+    printf("[CM55 FAULT] HFSR bits:");
+    if (0U == hfsr) { printf(" none"); }
+    if (0U != (hfsr & (1UL << 1))) { printf(" VECTTBL"); }
+    if (0U != (hfsr & (1UL << 30))) { printf(" FORCED"); }
+    if (0U != (hfsr & (1UL << 31))) { printf(" DEBUGEVT"); }
+    printf("\r\n");
+}
+
+static void print_cm55_fault_report(const app_cm55_boot_state_t *state)
+{
+    printf("[CM55 TEST] last=%s state=0x%08lx\r\n",
+           cm55_boot_state_to_string(state->last_state),
+           (unsigned long)state->state);
+    printf("[CM55 FAULT] type=%s fault=0x%08lx\r\n",
+           cm55_fault_to_string(state->fault),
+           (unsigned long)state->fault);
+    printf("[CM55 FAULT] PC=0x%08lx LR=0x%08lx xPSR=0x%08lx EXC_RETURN=0x%08lx\r\n",
+           (unsigned long)state->pc,
+           (unsigned long)state->lr,
+           (unsigned long)state->xpsr,
+           (unsigned long)state->exc_return);
+    printf("[CM55 FAULT] R0=0x%08lx R1=0x%08lx R2=0x%08lx R3=0x%08lx R12=0x%08lx\r\n",
+           (unsigned long)state->r0,
+           (unsigned long)state->r1,
+           (unsigned long)state->r2,
+           (unsigned long)state->r3,
+           (unsigned long)state->r12);
+    printf("[CM55 FAULT] MSP=0x%08lx PSP=0x%08lx MSPLIM=0x%08lx PSPLIM=0x%08lx CONTROL=0x%08lx\r\n",
+           (unsigned long)state->msp,
+           (unsigned long)state->psp,
+           (unsigned long)state->msplim,
+           (unsigned long)state->psplim,
+           (unsigned long)state->control);
+    printf("[CM55 FAULT] CFSR=0x%08lx HFSR=0x%08lx DFSR=0x%08lx AFSR=0x%08lx SHCSR=0x%08lx ICSR=0x%08lx VTOR=0x%08lx\r\n",
+           (unsigned long)state->cfsr,
+           (unsigned long)state->hfsr,
+           (unsigned long)state->dfsr,
+           (unsigned long)state->afsr,
+           (unsigned long)state->shcsr,
+           (unsigned long)state->icsr,
+           (unsigned long)state->vtor);
+    printf("[CM55 FAULT] BFAR=0x%08lx MMFAR=0x%08lx\r\n",
+           (unsigned long)state->bfar,
+           (unsigned long)state->mmfar);
+    print_cfsr_bits(state->cfsr);
+    print_hfsr_bits(state->hfsr);
 }
 
 static void task_cm55_events(void* arg)
 {
     CY_UNUSED_PARAMETER(arg);
     app_cm55_boot_state_t previous_boot_state = {0};
+    bool fault_reported = false;
 
 #if APP_CM55_STARTUP_DIAGNOSTICS
     printf("[CM55 TEST] monitor active\r\n");
@@ -878,9 +1016,15 @@ static void task_cm55_events(void* arg)
         {
             if (boot_state.state != previous_boot_state.state)
             {
-                printf("[CM55 TEST] state=0x%08lx fault=0x%08lx\r\n",
+                printf("[CM55 TEST] last=%s state=0x%08lx fault=0x%08lx\r\n",
+                       cm55_boot_state_to_string(boot_state.state),
                        (unsigned long)boot_state.state,
                        (unsigned long)boot_state.fault);
+            }
+            if ((APP_CM55_BOOT_FAULT == boot_state.state) && !fault_reported)
+            {
+                print_cm55_fault_report(&boot_state);
+                fault_reported = true;
             }
             if (boot_state.boot_entered != previous_boot_state.boot_entered)
             {

@@ -55,6 +55,10 @@ CONFIG=Debug
 # integration, so builds must use the checked-in generated files.
 SKIP_CODE_GEN=1
 
+# GFXSS is configured in BSP GeneratedSource and is initialized by the CM33_S
+# full cycfg path before CM55 uses the display/GPU registers.
+COMPONENTS+=GFXSS
+
 # Config file for postbuild sign and merge operations.
 # NOTE: Check the JSON file for the command parameters
 COMBINE_SIGN_JSON?=configs/boot_with_extended_boot.json

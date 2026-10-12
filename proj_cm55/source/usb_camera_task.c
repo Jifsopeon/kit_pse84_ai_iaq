@@ -991,6 +991,7 @@ static void _on_dev_ready(U8 dev_index)
             }
             else
             {
+                app_cm55_send_event(APP_EVENT_CM55_CAMERA_INIT_DONE);
                 app_cm55_send_event(APP_EVENT_CAMERA_INITIALIZED);
                 /* Wait until the device has been disconnected */ 
                 for (;;)
@@ -1104,6 +1105,7 @@ void cm55_usb_webcam_task(void *arg)
 
     USBH_VIDEO_Init();
     USBH_VIDEO_AddNotification(&hook, _add_remove_device_cb, NULL);
+    app_cm55_send_event(APP_EVENT_CM55_USB_INIT_DONE);
 
     while (true)
     {

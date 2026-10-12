@@ -35,6 +35,7 @@
 #include "cy_syspm.h"
 #include "cy_syslib.h"
 #include "cmsis_compiler.h"
+#include "shared_mem.h"
 
 #define SCB_NS_CPACR_CP10_CP11_ENABLE      (0xFUL << 20u)
 
@@ -64,11 +65,11 @@ typedef  void(*pGenericFunction)(uint8_t *pSrc, uint8_t* pDst, uint32_t len);   
 #define CY_SYSINT_EWIC_ENABLE_MSK     (0x1U) 		  /**< EWIC enable mask */
 
 __WEAK void Reset_Handler(void);
-void MemManage_Handler(void);
-void BusFault_Handler(void);
-void UsageFault_Handler(void);
+__WEAK void MemManage_Handler(void);
+__WEAK void BusFault_Handler(void);
+__WEAK void UsageFault_Handler(void);
 __WEAK void SVC_Handler(void);
-void DebugMon_Handler(void);
+__WEAK void DebugMon_Handler(void);
 __WEAK void PendSV_Handler(void);
 __WEAK void SysTick_Handler(void);
 void InterruptHandler(void);
@@ -165,11 +166,11 @@ __WEAK void HardFault_Handler(void)
     );
 }
 
-void MemManage_Handler(void)        {while(true){}}
-void BusFault_Handler(void)         {while(true){}}
-void UsageFault_Handler(void)       {while(true){}}
+__WEAK void MemManage_Handler(void) {while(true){}}
+__WEAK void BusFault_Handler(void)  {while(true){}}
+__WEAK void UsageFault_Handler(void){while(true){}}
 __WEAK void SVC_Handler(void)       {while(true){}}
-void DebugMon_Handler(void)         {while(true){}}
+__WEAK void DebugMon_Handler(void)  {while(true){}}
 __WEAK void PendSV_Handler(void)    {while(true){}}
 __WEAK void SysTick_Handler(void)   {while(true){}}
 
@@ -194,7 +195,7 @@ ExecFuncPtr __ns_vector_table[] __VECTOR_TABLE_ATTRIBUTE = {
     0,                                    // RESERVED
     0,                                    // RESERVED
     (ExecFuncPtr)SVC_Handler,             // SVC
-    0,                                    // debug
+    (ExecFuncPtr)DebugMon_Handler,        // debug
     0,                                    // RESERVED
     (ExecFuncPtr)PendSV_Handler,          // Pend SV
     (ExecFuncPtr)SysTick_Handler,         // Secure systick
@@ -499,6 +500,9 @@ __WEAK void Reset_Handler(void)
 
     SCB->VTOR = (uint32_t)__ns_vector_table_rw;
     __DMB();
+    SCB->SHCSR |= (SCB_SHCSR_MEMFAULTENA_Msk |
+                   SCB_SHCSR_BUSFAULTENA_Msk |
+                   SCB_SHCSR_USGFAULTENA_Msk);
 #if (defined (__FPU_USED) && (__FPU_USED == 1U)) || \
       (defined (__ARM_FEATURE_MVE) && (__ARM_FEATURE_MVE > 0U))
     SCB->CPACR |= SCB_NS_CPACR_CP10_CP11_ENABLE;
@@ -513,6 +517,10 @@ __WEAK void Reset_Handler(void)
     SCB_EnableICache();
     SCB_EnableDCache();
 
+#if APP_CM55_STARTUP_DIAGNOSTICS
+    app_cm55_boot_mark(APP_CM55_BOOT_MARK_RESET_HANDLER);
+#endif
+
 #if defined(__ICCARM__)
     /* Initialize data section */
     __iar_data_init3();
@@ -526,7 +534,14 @@ __WEAK void Reset_Handler(void)
     __iar_dynamic_initialization();
 #endif
 
+ #if APP_CM55_STARTUP_DIAGNOSTICS
+    app_cm55_boot_mark(APP_CM55_BOOT_MARK_SYSTEM_INIT_ENTER);
+#endif
     SystemInit();
+#if APP_CM55_STARTUP_DIAGNOSTICS
+    app_cm55_boot_mark(APP_CM55_BOOT_MARK_SYSTEM_INIT_DONE);
+    app_cm55_boot_mark(APP_CM55_BOOT_MARK_CRT_INIT_ENTER);
+#endif
 
     Cy_RuntimeInit();
 }
