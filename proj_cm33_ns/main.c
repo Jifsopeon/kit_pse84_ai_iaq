@@ -7,6 +7,7 @@
 #include "cybsp.h"
 #include "cy_time.h"
 #include "cy_retarget_io.h"
+#include "cy_syspm_ppu.h"
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -19,6 +20,7 @@
 #include "app_ble_iaq.h"
 #include "app_radar.h"
 #include "sen66_prediction.h"
+#include "shared_mem.h"
 
 #include <math.h>
 #include <stdbool.h>
@@ -27,7 +29,7 @@
 #include <string.h>
 
 #define CM55_BOOT_WAIT_TIME_USEC            (10U)
-#define CM55_APP_BOOT_ADDR                  (CYMEM_CM33_0_m55_nvm_START + CYBSP_MCUBOOT_HEADER_SIZE)
+#define CM55_APP_BOOT_ADDR                  (CY_CM55_APP_BOOT_ADDR)
 #define LPTIMER_0_WAIT_TIME_USEC            (62U)
 #define APP_LPTIMER_INTERRUPT_PRIORITY      (1U)
 
@@ -37,6 +39,10 @@
 #define RADAR_TASK_PRIORITY                 (tskIDLE_PRIORITY + 1U)
 #define RADAR_TASK_STACK_SIZE               (4096U)
 #define RADAR_TASK_PERIOD_MS                (20U)
+#define CM55_EVENT_TASK_PRIORITY            (tskIDLE_PRIORITY + 1U)
+#define CM55_EVENT_TASK_STACK_SIZE          (1024U)
+#define CM55_EVENT_POLL_PERIOD_MS           (50U)
+#define CM55_START_SETTLE_DELAY_US          (100U)
 #define SEN66_STARTUP_DELAY_MS              (1200U)
 #define SEN66_SAMPLE_PERIOD_DEFAULT_MS      (1000U)
 #define SEN66_SAMPLE_PERIOD_MIN_MS          (1000U)
@@ -117,6 +123,57 @@ static mtb_hal_uart_t debug_uart_obj;
 
 static volatile bool app_manual_smoking = false;
 static volatile uint16_t app_distance_cm = 0U;
+
+static const char *app_event_to_string(app_event_t event)
+{
+    switch (event)
+    {
+        case APP_EVENT_CAMERA_INITIALIZED:
+            return "Camera initialized";
+        case APP_EVENT_CAMERA_FAILED:
+            return "Camera failed";
+        case APP_EVENT_DISPLAY_INITIALIZED:
+            return "Display initialized";
+        case APP_EVENT_DISPLAY_FAILED:
+            return "Display failed";
+        case APP_EVENT_MODEL_INITIALIZED:
+            return "Model initialized";
+        case APP_EVENT_MODEL_FAILED:
+            return "Model failed";
+        case APP_EVENT_INFERENCE_FAILED:
+            return "Inference failed";
+        case APP_EVENT_SMOKE_DETECTED:
+            return "Smoke";
+        case APP_EVENT_CM55_BOOT_ENTERED:
+            return "[CM55] Boot";
+        case APP_EVENT_CM55_MAIN_ENTERED:
+            return "[CM55] Main";
+        case APP_EVENT_CM55_RTOS_STARTED:
+            return "[CM55] RTOS";
+        case APP_EVENT_CM55_APP_INIT_ENTERED:
+            return "[CM55] App init";
+        case APP_EVENT_CM55_DISPLAY_INIT_ENTERED:
+            return "[CM55] Display init";
+        case APP_EVENT_CM55_DISPLAY_INIT_DONE:
+            return "[CM55] Display init done";
+        case APP_EVENT_CM55_USB_INIT_ENTERED:
+            return "[CM55] USB init";
+        case APP_EVENT_CM55_USB_INIT_DONE:
+            return "[CM55] USB init done";
+        case APP_EVENT_CM55_CAMERA_INIT_ENTERED:
+            return "[CM55] Camera init";
+        case APP_EVENT_CM55_CAMERA_INIT_DONE:
+            return "[CM55] Camera init done";
+        case APP_EVENT_CM55_MODEL_INIT_ENTERED:
+            return "[CM55] Model init";
+        case APP_EVENT_CM55_MODEL_INIT_DONE:
+            return "[CM55] Model init done";
+        case APP_EVENT_CM55_VIDEO_TASK_STARTED:
+            return "[CM55] Video task";
+        default:
+            return NULL;
+    }
+}
 
 static bool distance_m_is_valid(float distance_m)
 {
@@ -624,6 +681,7 @@ static void task_sen66_stream(void* arg)
     uint8_t sw1_stable_pressed_count = 0U;
     uint32_t sample_period_ms = SEN66_SAMPLE_PERIOD_DEFAULT_MS;
     uint16_t sequence = 0U;
+    bool sensor_streaming = true;
 
     set_manual_label(manual_smoking);
     set_distance_cm(0U);
@@ -660,7 +718,7 @@ static void task_sen66_stream(void* arg)
     if (NO_ERROR != error)
     {
         printf("sen66_start_error:%d\r\n", error);
-        vTaskSuspend(NULL);
+        sensor_streaming = false;
     }
 
     wait_sample_period_and_update_label(&manual_smoking, &sw1_was_pressed,
@@ -692,6 +750,11 @@ static void task_sen66_stream(void* arg)
 
         wait_sample_period_and_update_label(&manual_smoking, &sw1_was_pressed,
                                             &sw1_stable_pressed_count, &sample_period_ms);
+
+        if (!sensor_streaming)
+        {
+            continue;
+        }
 
         error = sen66_read_measured_values_as_integers(&pm1p0, &pm2p5, &pm4p0, &pm10p0,
                                                        &humidity, &temperature, &voc, &nox, &co2);
@@ -759,24 +822,241 @@ static void task_radar(void* arg)
 
     if (CY_RSLT_SUCCESS != result)
     {
-        printf("[RADAR] disabled result=0x%08lx; continuing without radar\r\n",
-               (unsigned long)result);
+        printf("Radar failed\r\n");
         vTaskSuspend(NULL);
     }
+
+    printf("Radar initialized\r\n");
 
     for (;;)
     {
         cy_rslt_t process_result = radar_process();
         if (CY_RSLT_SUCCESS != process_result)
         {
-            printf("[RADAR] process error result=0x%08lx; attempting recovery\r\n",
-                   (unsigned long)process_result);
             if (CY_RSLT_SUCCESS != radar_start())
             {
                 vTaskDelay(pdMS_TO_TICKS(1000U));
             }
         }
         vTaskDelay(pdMS_TO_TICKS(RADAR_TASK_PERIOD_MS));
+    }
+}
+
+static uint32_t cm55_ppu_power_mode(const void *base)
+{
+    return cy_pd_ppu_get_power_mode((struct ppu_v1_reg *)base);
+}
+
+static void print_cm55_start_status(const char *phase)
+{
+    volatile const uint32_t *vector_table = (volatile const uint32_t *)CM55_APP_BOOT_ADDR;
+    uint32_t msp = vector_table[0];
+    uint32_t reset = vector_table[1];
+    uint32_t core_status = Cy_SysGetCM55Status(MXCM55);
+
+    printf("[CM55 START] %s vector=0x%08lx msp=0x%08lx reset=0x%08lx core=%lu pd1=%lu appcpuss=%lu appcpu=%lu socmem=%lu shared=0x%08lx end=0x%08lx size=%lu api=void\r\n",
+           phase,
+           (unsigned long)CM55_APP_BOOT_ADDR,
+           (unsigned long)msp,
+           (unsigned long)reset,
+           (unsigned long)core_status,
+           (unsigned long)cm55_ppu_power_mode(PWRMODE_PPU_PD1),
+           (unsigned long)cm55_ppu_power_mode(PPU_APPCPUSS),
+           (unsigned long)cm55_ppu_power_mode(PPU_CM55_0),
+           (unsigned long)cm55_ppu_power_mode(SOCMEM_PPU_SOCMEM),
+           (unsigned long)app_shared_data_address(),
+           (unsigned long)app_shared_data_end_address(),
+           (unsigned long)app_shared_data_size());
+}
+
+static const char *cm55_boot_state_to_string(uint32_t state)
+{
+    switch (state)
+    {
+        case APP_CM55_BOOT_NONE: return "NONE";
+        case APP_CM55_BOOT_RESET_HANDLER: return "RESET_HANDLER";
+        case APP_CM55_BOOT_SYSTEM_INIT_ENTER: return "SYSTEM_INIT_ENTER";
+        case APP_CM55_BOOT_SYSTEM_INIT_DONE: return "SYSTEM_INIT_DONE";
+        case APP_CM55_BOOT_CRT_INIT_ENTER: return "CRT_INIT_ENTER";
+        case APP_CM55_BOOT_MAIN_ENTER: return "MAIN_ENTER";
+        case APP_CM55_BOOT_PLATFORM_INIT_ENTER: return "PLATFORM_INIT_ENTER";
+        case APP_CM55_BOOT_PLATFORM_INIT_DONE: return "PLATFORM_INIT_DONE";
+        case APP_CM55_BOOT_PSRAM_INIT_ENTER: return "PSRAM_INIT_ENTER";
+        case APP_CM55_BOOT_PSRAM_INIT_DONE: return "PSRAM_INIT_DONE";
+        case APP_CM55_BOOT_RTOS_CREATE: return "RTOS_CREATE";
+        case APP_CM55_BOOT_SCHEDULER_STARTED: return "SCHEDULER_STARTED";
+        case APP_CM55_BOOT_APP_INIT_ENTER: return "APP_INIT_ENTER";
+        case APP_CM55_BOOT_DISPLAY_INIT_ENTER: return "DISPLAY_INIT_ENTER";
+        case APP_CM55_BOOT_USB_INIT_ENTER: return "USB_INIT_ENTER";
+        case APP_CM55_BOOT_MODEL_INIT_ENTER: return "MODEL_INIT_ENTER";
+        case APP_CM55_BOOT_DISPLAY_INIT_DONE: return "DISPLAY_INIT_DONE";
+        case APP_CM55_BOOT_USB_INIT_DONE: return "USB_INIT_DONE";
+        case APP_CM55_BOOT_MODEL_INIT_DONE: return "MODEL_INIT_DONE";
+        case APP_CM55_BOOT_CAMERA_INIT_ENTER: return "CAMERA_INIT_ENTER";
+        case APP_CM55_BOOT_CAMERA_INIT_DONE: return "CAMERA_INIT_DONE";
+        case APP_CM55_BOOT_FAULT: return "FAULT";
+        default: return "UNKNOWN";
+    }
+}
+
+static const char *cm55_fault_to_string(uint32_t fault)
+{
+    switch (fault)
+    {
+        case APP_CM55_FAULT_HARDFAULT: return "HardFault";
+        case APP_CM55_FAULT_MEMMANAGE: return "MemManage";
+        case APP_CM55_FAULT_BUSFAULT: return "BusFault";
+        case APP_CM55_FAULT_USAGEFAULT: return "UsageFault";
+        case APP_CM55_FAULT_DEBUGMON: return "DebugMon";
+        default: return "Unknown";
+    }
+}
+
+static void print_cfsr_bits(uint32_t cfsr)
+{
+    printf("[CM55 FAULT] MMFSR:");
+    if (0U == (cfsr & 0x000000FFUL)) { printf(" none"); }
+    if (0U != (cfsr & (1UL << 0))) { printf(" IACCVIOL"); }
+    if (0U != (cfsr & (1UL << 1))) { printf(" DACCVIOL"); }
+    if (0U != (cfsr & (1UL << 3))) { printf(" MUNSTKERR"); }
+    if (0U != (cfsr & (1UL << 4))) { printf(" MSTKERR"); }
+    if (0U != (cfsr & (1UL << 5))) { printf(" MLSPERR"); }
+    if (0U != (cfsr & (1UL << 7))) { printf(" MMARVALID"); }
+    printf("\r\n");
+
+    printf("[CM55 FAULT] BFSR:");
+    if (0U == (cfsr & 0x0000FF00UL)) { printf(" none"); }
+    if (0U != (cfsr & (1UL << 8))) { printf(" IBUSERR"); }
+    if (0U != (cfsr & (1UL << 9))) { printf(" PRECISERR"); }
+    if (0U != (cfsr & (1UL << 10))) { printf(" IMPRECISERR"); }
+    if (0U != (cfsr & (1UL << 11))) { printf(" UNSTKERR"); }
+    if (0U != (cfsr & (1UL << 12))) { printf(" STKERR"); }
+    if (0U != (cfsr & (1UL << 13))) { printf(" LSPERR"); }
+    if (0U != (cfsr & (1UL << 15))) { printf(" BFARVALID"); }
+    printf("\r\n");
+
+    printf("[CM55 FAULT] UFSR:");
+    if (0U == (cfsr & 0xFFFF0000UL)) { printf(" none"); }
+    if (0U != (cfsr & (1UL << 16))) { printf(" UNDEFINSTR"); }
+    if (0U != (cfsr & (1UL << 17))) { printf(" INVSTATE"); }
+    if (0U != (cfsr & (1UL << 18))) { printf(" INVPC"); }
+    if (0U != (cfsr & (1UL << 19))) { printf(" NOCP"); }
+    if (0U != (cfsr & (1UL << 20))) { printf(" STKOF"); }
+    if (0U != (cfsr & (1UL << 24))) { printf(" UNALIGNED"); }
+    if (0U != (cfsr & (1UL << 25))) { printf(" DIVBYZERO"); }
+    printf("\r\n");
+}
+
+static void print_hfsr_bits(uint32_t hfsr)
+{
+    printf("[CM55 FAULT] HFSR bits:");
+    if (0U == hfsr) { printf(" none"); }
+    if (0U != (hfsr & (1UL << 1))) { printf(" VECTTBL"); }
+    if (0U != (hfsr & (1UL << 30))) { printf(" FORCED"); }
+    if (0U != (hfsr & (1UL << 31))) { printf(" DEBUGEVT"); }
+    printf("\r\n");
+}
+
+static void print_cm55_fault_report(const app_cm55_boot_state_t *state)
+{
+    printf("[CM55 TEST] last=%s state=0x%08lx\r\n",
+           cm55_boot_state_to_string(state->last_state),
+           (unsigned long)state->state);
+    printf("[CM55 FAULT] type=%s fault=0x%08lx\r\n",
+           cm55_fault_to_string(state->fault),
+           (unsigned long)state->fault);
+    printf("[CM55 FAULT] PC=0x%08lx LR=0x%08lx xPSR=0x%08lx EXC_RETURN=0x%08lx\r\n",
+           (unsigned long)state->pc,
+           (unsigned long)state->lr,
+           (unsigned long)state->xpsr,
+           (unsigned long)state->exc_return);
+    printf("[CM55 FAULT] R0=0x%08lx R1=0x%08lx R2=0x%08lx R3=0x%08lx R12=0x%08lx\r\n",
+           (unsigned long)state->r0,
+           (unsigned long)state->r1,
+           (unsigned long)state->r2,
+           (unsigned long)state->r3,
+           (unsigned long)state->r12);
+    printf("[CM55 FAULT] MSP=0x%08lx PSP=0x%08lx MSPLIM=0x%08lx PSPLIM=0x%08lx CONTROL=0x%08lx\r\n",
+           (unsigned long)state->msp,
+           (unsigned long)state->psp,
+           (unsigned long)state->msplim,
+           (unsigned long)state->psplim,
+           (unsigned long)state->control);
+    printf("[CM55 FAULT] CFSR=0x%08lx HFSR=0x%08lx DFSR=0x%08lx AFSR=0x%08lx SHCSR=0x%08lx ICSR=0x%08lx VTOR=0x%08lx\r\n",
+           (unsigned long)state->cfsr,
+           (unsigned long)state->hfsr,
+           (unsigned long)state->dfsr,
+           (unsigned long)state->afsr,
+           (unsigned long)state->shcsr,
+           (unsigned long)state->icsr,
+           (unsigned long)state->vtor);
+    printf("[CM55 FAULT] BFAR=0x%08lx MMFAR=0x%08lx\r\n",
+           (unsigned long)state->bfar,
+           (unsigned long)state->mmfar);
+    print_cfsr_bits(state->cfsr);
+    print_hfsr_bits(state->hfsr);
+}
+
+static void task_cm55_events(void* arg)
+{
+    CY_UNUSED_PARAMETER(arg);
+    app_cm55_boot_state_t previous_boot_state = {0};
+    bool fault_reported = false;
+
+#if APP_CM55_STARTUP_DIAGNOSTICS
+    printf("[CM55 TEST] monitor active\r\n");
+#endif
+
+    for (;;)
+    {
+#if APP_CM55_STARTUP_DIAGNOSTICS
+        app_cm55_boot_state_t boot_state;
+        app_cm55_boot_state_read(&boot_state);
+        if (boot_state.magic == APP_CM55_BOOT_STATE_MAGIC)
+        {
+            if (boot_state.state != previous_boot_state.state)
+            {
+                printf("[CM55 TEST] last=%s state=0x%08lx fault=0x%08lx\r\n",
+                       cm55_boot_state_to_string(boot_state.state),
+                       (unsigned long)boot_state.state,
+                       (unsigned long)boot_state.fault);
+            }
+            if ((APP_CM55_BOOT_FAULT == boot_state.state) && !fault_reported)
+            {
+                print_cm55_fault_report(&boot_state);
+                fault_reported = true;
+            }
+            if (boot_state.boot_entered != previous_boot_state.boot_entered)
+            {
+                printf("[CM55] boot mark:%lu\r\n", (unsigned long)boot_state.boot_entered);
+            }
+            if (boot_state.main_entered != previous_boot_state.main_entered)
+            {
+                printf("[CM55] main mark:%lu\r\n", (unsigned long)boot_state.main_entered);
+            }
+            if (boot_state.app_init_entered != previous_boot_state.app_init_entered)
+            {
+                printf("[CM55] app-init mark:%lu\r\n", (unsigned long)boot_state.app_init_entered);
+            }
+            if (boot_state.rtos_started != previous_boot_state.rtos_started)
+            {
+                printf("[CM55] rtos mark:%lu\r\n", (unsigned long)boot_state.rtos_started);
+            }
+            previous_boot_state = boot_state;
+        }
+#endif
+
+        app_event_t event;
+        while (app_event_try_receive(&event))
+        {
+            const char *message = app_event_to_string(event);
+            if (NULL != message)
+            {
+                printf("%s\r\n", message);
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(CM55_EVENT_POLL_PERIOD_MS));
     }
 }
 
@@ -801,8 +1081,18 @@ int main(void)
     setup_retarget_io();
     __enable_irq();
     app_ble_iaq_init();
+    app_cm55_boot_state_init();
+    app_event_queue_init();
 
     Cy_SysEnableCM55(MXCM55, CM55_APP_BOOT_ADDR, CM55_BOOT_WAIT_TIME_USEC);
+    Cy_SysLib_DelayUs(CM55_START_SETTLE_DELAY_US);
+    print_cm55_start_status("after");
+
+    if (pdPASS != xTaskCreate(task_cm55_events, "CM55_EVENTS", CM55_EVENT_TASK_STACK_SIZE,
+                              NULL, CM55_EVENT_TASK_PRIORITY, NULL))
+    {
+        printf("CM55 event task failed\r\n");
+    }
 
     if (pdPASS != xTaskCreate(task_sen66_stream, "SEN66", SEN66_TASK_STACK_SIZE,
                               NULL, SEN66_TASK_PRIORITY, NULL))
@@ -822,4 +1112,3 @@ int main(void)
 }
 
 /* [] END OF FILE */
-

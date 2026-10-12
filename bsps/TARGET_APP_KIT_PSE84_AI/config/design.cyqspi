@@ -98,18 +98,18 @@
         </SlotConfig>
         <SlotConfig>
             <SlaveSlot>6</SlaveSlot>
-            <MemoryId>Not used</MemoryId>
-            <MemoryMapped>false</MemoryMapped>
+            <MemoryId>S70KS1283 (200 MHz)</MemoryId>
+            <MemoryMapped>true</MemoryMapped>
             <DualQuad>None</DualQuad>
-            <StartAddress>0x60000000</StartAddress>
-            <Size>0x10000</Size>
-            <EndAddress>0x6000FFFF</EndAddress>
-            <WriteEnable>false</WriteEnable>
+            <StartAddress>0x64000000</StartAddress>
+            <Size>0x4000000</Size>
+            <EndAddress>0x67FFFFFF</EndAddress>
+            <WriteEnable>true</WriteEnable>
             <Encrypt>false</Encrypt>
-            <DataSelect>DUAL_SPI_DATA_0_1</DataSelect>
-            <MemoryConfigsPath>default_memory.xml</MemoryConfigsPath>
+            <DataSelect>OCTAL_SPI_DATA_0_7</DataSelect>
+            <MemoryConfigsPath>S70KS1283 (200 MHz)</MemoryConfigsPath>
             <ConfigDataInFlash>false</ConfigDataInFlash>
-            <MergeTimeout>CY_SMIF_MERGE_TIMEOUT_DISABLED</MergeTimeout>
+            <MergeTimeout>CY_SMIF_MERGE_TIMEOUT_4096_CYCLES</MergeTimeout>
         </SlotConfig>
         <SlotConfig>
             <SlaveSlot>7</SlaveSlot>

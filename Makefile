@@ -38,6 +38,11 @@ MTB_TYPE=APPLICATION
 
 MTB_PROJECTS=proj_cm33_s proj_cm33_ns proj_cm55
 
+# The CM55 display/ML integration carries checked-in BSP GeneratedSource
+# changes, so builds must not regenerate configurator output.
+SKIP_CODE_GEN=1
+export SKIP_CODE_GEN
+
 ################################################################################
 # Paths
 ################################################################################

@@ -55,8 +55,6 @@
 #include "cycfg_system.h"
 #endif
 
-
-
 #define configUSE_PREEMPTION                    1
 #define configUSE_PORT_OPTIMISED_TASK_SELECTION 0
 #if defined (__ICCARM__) || (__GNUC__)
@@ -65,7 +63,7 @@ extern uint32_t SystemCoreClock;
 #define configCPU_CLOCK_HZ                      SystemCoreClock
 #define configTICK_RATE_HZ                      ((TickType_t ) 1000)
 #define configMAX_PRIORITIES                    7
-#define configMINIMAL_STACK_SIZE                128
+#define configMINIMAL_STACK_SIZE                512
 #define configMAX_TASK_NAME_LEN                 16
 #define configUSE_16_BIT_TICKS                  0
 #define configIDLE_SHOULD_YIELD                 1
@@ -107,6 +105,13 @@ extern uint32_t SystemCoreClock;
 #define configGENERATE_RUN_TIME_STATS           0
 #define configUSE_TRACE_FACILITY                1
 #define configUSE_STATS_FORMATTING_FUNCTIONS    0
+
+#if ( configGENERATE_RUN_TIME_STATS == 1 )
+extern void setup_run_time_stats_timer(void);
+#define portCONFIGURE_TIMER_FOR_RUN_TIME_STATS() setup_run_time_stats_timer()
+extern uint32_t get_run_time_counter_value(void);
+#define portGET_RUN_TIME_COUNTER_VALUE() get_run_time_counter_value()
+#endif
 
 /* Co-routine related definitions. */
 #define configUSE_CO_ROUTINES                   0
@@ -189,9 +194,6 @@ standard names - or at least those used in the unmodified vector table. */
 /* Enable low power tickless functionality. The RTOS abstraction library
  * provides the compatible implementation of the vApplicationSleep hook:
  * https://github.com/Infineon/abstraction-rtos#freertos
- * The Low Power Assistant library provides additional portable configuration layer
- * for low-power features supported by the PSoC 6 devices:
- * https://github.com/Infineon/lpa
  */
 extern void vApplicationSleep( uint32_t xExpectedIdleTime );
 #define portSUPPRESS_TICKS_AND_SLEEP( xIdleTime ) vApplicationSleep( xIdleTime )
