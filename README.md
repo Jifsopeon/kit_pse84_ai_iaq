@@ -1,6 +1,6 @@
 # PSoC Edge E84 Air Quality Firmware
 
-Firmware for an  smoking-detection research prototype on the Infineon **KIT_PSE84_AI**. It combines a Sensirion SEN66 environmental sensor, XENSIV radar, USB camera inference, a local display, and Bluetooth Low Energy (BLE). The [PSE84 IAQ Monitor app](https://github.com/Jifsopeon/BLE_APP/tree/master) displays the environmental stream and records labelled samples.
+Firmware for an  smoking-detection research prototype on the Infineon **KIT_PSE84_AI**. It combines a Sensirion SEN66 environmental sensor, XENSIV radar, USB camera inference, a local display, and Bluetooth Low Energy (BLE). The [PSE84 Air Quality Monitor app](https://github.com/Jifsopeon/BLE_APP/tree/master) displays the environmental stream and records labelled samples.
 
 ## What runs on each core
 
